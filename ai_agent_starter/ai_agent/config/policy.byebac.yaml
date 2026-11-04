@@ -1,0 +1,27 @@
+# Policy Configuration for BAC (Broken Access Control) Testing
+#
+# The ground truth for allow/deny expectations is derived at load time from the
+# backend endpoint catalog referenced below. loadCatalogPolicy() only runs when
+# this file names a `catalog` and contains no inline `rules`/`rbac_rules`, so do
+# not add those keys here unless you intend to override the catalog.
+catalog: data/rbac/endpoint_flows.json
+
+# Documentation only (not consumed by the loader): the five access-control flaws
+# intentionally planted in the backend. Each should surface as a false-allow (FP)
+# in the confusion matrix when the runtime check is missing.
+intentional_bac_findings:
+  - id: VULN-LEAVE-DELETE-OTHER
+    operation: DELETE /leaves/{id}/
+    note: employee can delete another owner's leave (missing owner check)
+  - id: VULN-USERS-CREATE
+    operation: POST /users/
+    note: employee can create users (admin_only endpoint)
+  - id: VULN-USER-PROFILE-READ
+    operation: GET /users/{id}/
+    note: employee can read another user's profile (missing owner check on GET)
+  - id: VULN-ROLE-SELF-PATCH
+    operation: PATCH /users/{id}/ with role=admin
+    note: employee can set admin role on own profile (role field is admin_only)
+  - id: VULN-ROLE-SELF-PUT
+    operation: PUT /users/{id}/ with role=admin
+    note: employee can set admin role on own profile (role field is admin_only)

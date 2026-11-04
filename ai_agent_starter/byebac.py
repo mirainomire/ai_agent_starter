@@ -20,6 +20,7 @@ import argparse
 import subprocess
 from pathlib import Path
 from datetime import datetime
+from ai_agent import __version__
 
 # Fix encoding for Windows console (avoid UnicodeEncodeError on banner/emojis)
 if sys.platform == "win32":
@@ -82,7 +83,7 @@ def print_banner():
     ║        🔒 Broken Access Control Detection Agent 🤖           ║
     ║                                                              ║
     ║    AI-Powered Security Testing for RBAC APIs                 ║
-    ║    Version 1.0.0 | Made with ❤️  for Secure APIs              ║ 
+    ║    Version {__version__} | Made with ❤️  for Secure APIs              ║
     ╚══════════════════════════════════════════════════════════════╝
     {Colors.ENDC}"""
     print(banner)
@@ -572,7 +573,9 @@ def show_status():
         metrics = data.get('metrics', {})
         
         print(f"{Colors.BOLD}Test Summary:{Colors.ENDC}")
-        print(f"  Total Tests: {Colors.OKCYAN}{summary.get('total_tests', 'N/A')}{Colors.ENDC}")
+        print(f"  Generated Cases: {Colors.OKCYAN}{summary.get('generated_cases', 'N/A')}{Colors.ENDC}")
+        print(f"  Result Records: {Colors.OKCYAN}{summary.get('result_records', 'N/A')}{Colors.ENDC}")
+        print(f"  Evaluated Cases: {Colors.OKCYAN}{summary.get('evaluated_cases', metrics.get('evaluated_cases', 'N/A'))}{Colors.ENDC}")
         
         # Calculate total execution duration
         total_duration = data.get('total_duration_seconds')
@@ -596,8 +599,8 @@ def show_status():
         print(f"\n{Colors.BOLD}Confusion Matrix:{Colors.ENDC}")
         print(f"  True Positives (TP): {Colors.OKGREEN}{confusion.get('TP', 0)}{Colors.ENDC}")
         print(f"  True Negatives (TN): {Colors.OKGREEN}{confusion.get('TN', 0)}{Colors.ENDC}")
-        print(f"  False Positives (FP): {Colors.WARNING}{confusion.get('FP', 0)}{Colors.ENDC}")
-        print(f"  False Negatives (FN): {Colors.FAIL}{confusion.get('FN', 0)}{Colors.ENDC}")
+        print(f"  False Positives / False Allows (FP): {Colors.FAIL}{confusion.get('FP', 0)}{Colors.ENDC}")
+        print(f"  False Negatives / False Denials (FN): {Colors.WARNING}{confusion.get('FN', 0)}{Colors.ENDC}")
         print(f"  Errors (ERR): {Colors.FAIL}{confusion.get('ERR', 0)}{Colors.ENDC}")
         print(f"  Not Found (NF): {Colors.WARNING}{confusion.get('NF', 0)}{Colors.ENDC}")
         
@@ -667,7 +670,9 @@ def run_agent():
         tail_buf = []
         assert proc.stdout is not None
         for line in proc.stdout:
-            print(line, end="")
+            # Explicit flush is required on Windows/Cursor terminals; otherwise
+            # several completed endpoint lines may be rendered as one burst.
+            print(line, end="", flush=True)
             tail_buf.append(line.rstrip("\n"))
             if len(tail_buf) > 80:
                 tail_buf.pop(0)

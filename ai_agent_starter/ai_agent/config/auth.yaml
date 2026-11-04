@@ -1,35 +1,37 @@
 # config/auth.yaml
-# Prefer AUTH_BASE_URL from .env; fallback to agent.yaml base_url if unset
-base_url: "http://127.0.0.1:8000/api/"  # ✅ Set to include /api/ prefix
+# Login base URL. Leave unset so the auth client follows API_BASE_URL (or
+# agent.yaml base_url) like the main request client. Set AUTH_BASE_URL in the
+# environment only when the login host must differ from the API host.
+# base_url: "http://127.0.0.1:8000/api/"
 
 roles:
   Admin_HC:
-    login_endpoint: /auth/login/  # ✅ Relative path (base_url already includes /api/)
-    user_field: "username"  # ✅ Explicitly set to match LoginRequest schema
-    credentials:
-      username: "admin"  # ✅ Updated: username changed from "admin" to "newusername"
-      password: "admin123"
-    
-  Employee:
-    login_endpoint: /auth/login/  # ✅ Relative path (base_url already includes /api/)
-    user_field: "username"  # ✅ Explicitly set to match LoginRequest schema
-    credentials:
-      username: "employee1"  # ✅ Updated per OpenAPI test users (Employee1)
-      password: "employee123"
-  
-  # ✅ Tambah test users
-  Employee_2:  # untuk test IDOR
-    login_endpoint: /auth/login/  # ✅ Relative path (base_url already includes /api/)
-    user_field: "username"  # ✅ Explicitly set to match LoginRequest schema
-    credentials:
-      username: "employee2"  # ✅ Updated per OpenAPI test users (Employee2)
-      password: "employee123"
+    policy_role: Admin
+    account_label: admin
+    login_endpoint: /auth/login/  # BYE BAC (Django APPEND_SLASH) requires trailing slash
+    user_field: "username"  # BYE BAC LoginRequest schema uses `username`
+    # Credentials are required from ADMIN_USERNAME/ADMIN_PASSWORD at runtime.
 
-# ✅ Token settings
+  Employee:
+    policy_role: Employee
+    account_label: employee1
+    login_endpoint: /auth/login/
+    user_field: "username"
+    # Credentials are required from EMPLOYEE_USERNAME/EMPLOYEE_PASSWORD.
+
+  # Tambah test users
+  Employee_2:  # for IDOR testing
+    policy_role: Employee
+    account_label: employee2
+    login_endpoint: /auth/login/
+    user_field: "username"
+    # Credentials are required from EMPLOYEE_2_USERNAME/EMPLOYEE_2_PASSWORD.
+
+# Token settings
 token:
-  type: "Bearer"  # atau "JWT"
+  type: "Bearer"  # or "JWT"
   header: "Authorization"
-  token_json_path: "access"  # ✅ Field name in login response (access, refresh, token)
+  token_json_path: "access"  # BYE BAC returns the JWT in the `access` field
   refresh_endpoint: /auth/refresh
   cache_enabled: true
   cache_ttl: 3600  # 1 jam

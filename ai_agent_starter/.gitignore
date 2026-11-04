@@ -23,8 +23,9 @@ ai_agent/venv/
 .env.*
 !.env.example
 
-# Runtime outputs
+# Runtime outputs (reports, artifacts, and generated test results)
 ai_agent/runs/
+ai_agent/data/test_scenarios.csv
 
 # OS/editor noise
 .DS_Store

@@ -1,7 +1,10 @@
-base_url: "http://127.0.0.1:8000/api/"
+# Base URL comes from API_BASE_URL in .env (single source). The line below is
+# only an optional fallback if API_BASE_URL is not set; keep it commented out
+# so no host is hardcoded.
+# base_url: "http://127.0.0.1:8000/api/"
 timeout_s: 45
 retries: 2
-depth: 1
+depth: 2
 mode: "development"
 concurrency: 2
 artifacts_dir: "ai_agent/runs/artifacts"
@@ -9,21 +12,40 @@ log_dir: "ai_agent/runs/logs"
 dry_run: false
 request_delay_ms: 250 
 
+# Enable POST/PUT/PATCH/DELETE and fixtures for this API test configuration.
+# These requests can create, update, or delete target data.
+execution:
+  allow_state_changes: true
+
 # LLM features (privacy-first):
 llm:
-  discovery_enabled: true       # allow LLM to assist ID discovery
-  triage_enabled: true          # summarize findings via LLM (redacted input)
-  followups_enabled: true       # propose additional follow-up tests via LLM
+  # Quota-light mode: the plan comes deterministically from OAS, one LLM call
+  # chooses path IDs from observed records, and one LLM call writes the summary.
+  id_selection_enabled: true
+  id_selection_required: true   # stop the run if the ID choice fails; never relabel fallback as AI (run_agent mode 1 turns all LLM steps off)
+  id_selection_max_candidates: 8
+  resource_recovery_enabled: false  # one LLM call per failed case; disabled to save quota
+  generation_enabled: false
+  generation_required: false
+  generation_batch_size: 28
+  transient_retries: 2          # retry only 502/503/timeout, never 400/404/429
+  retry_delay_s: 3              # exponential waits: 3s, then 6s
+  discovery_enabled: false      # deterministic discovery stores IDs without quota use
+  triage_enabled: false         # reserve the LLM call for test generation
+  # Suspicious observations use the original bounded follow-up variants.
+  followups_enabled: false
+  followups_required: false
   redact_enabled: true          # redact content before sending to LLM
-  redact_max_chars: 1000        # cap any text snippets sent to LLM
-  summary_required: true     # allow run to finish even if LLM summary is temporarily unavailable
+  redact_max_chars: 500         # reduce tokens while retaining a bounded response excerpt
+  summary_required: false       # deterministic report remains valid if LLM summary is unavailable
 
 planning:
-  plan_with_llm: true           # use LLM-assisted planning for endpoint selection/prioritization
-  policy_first: false           # test berdasarkan OpenAPI (semua endpoint), bukan hanya policy
-  include_all_endpoints: true   # sertakan semua endpoint (tidak hanya yang {id})
-  max_endpoints: all            # tanpa batas (gunakan semua)
-  role_filter: ["Admin_HC", "Employee", "Employee_2"]  # aktifkan 3 role untuk cakupan penuh
+  plan_with_llm: false          # fixed policy-first matrix for reproducible evaluation
+  policy_first: true            # policy defines expectations; OpenAPI defines the endpoint inventory
+  include_all_endpoints: true   # include all endpoints (not only {id} ones)
+  max_endpoints: all            # no limit (use all)
+  # Empty means use all authentication accounts from auth.yaml.
+  role_filter: []
 
 # Auto-discovery of resource IDs via list endpoints (simple patterns only)
 discovery:

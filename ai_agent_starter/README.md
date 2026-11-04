@@ -1,5 +1,7 @@
 # BYE BAC: AI-Powered Broken Access Control Detection Agent
 
+Current version: **1.1.0** (updated 2026-10-29)
+
 ## Description
 BYE BAC is an automated security testing agent for detecting Broken Access Control (BAC) issues in REST APIs that use Role-Based Access Control (RBAC).  
 The project combines policy-aware test planning, role-based authentication, HTTP execution, and result evaluation to identify BAC categories such as BOLA/IDOR, privilege escalation, and authorization bypass.
@@ -112,9 +114,53 @@ python ai_agent/scripts/run_agent.py
 
 ### 4) Output artifacts
 Results are saved in `ai_agent/runs`:
-- `BAC_Security_Test_Report-*.json`
-- `BAC_Security_Test_Report-*.md`
+- `report-*.json`
+- `report-*.md`
 - request/response artifacts for evidence and traceability
+
+The report includes the endpoint inventory and planned cases. It does not write
+generated scan results into `ai_agent/data`, which is reserved for configured
+inputs and research datasets.
+
+### General API and access-policy behavior
+- The OpenAPI document is the endpoint inventory. Operations documented there
+  are considered even when no policy rule names them.
+- `ai_agent/config/policy.yaml` is the source of expected access. Supported
+  inputs include `public_endpoints`, explicit `rules`, per-role `rbac_rules`,
+  and `self_only_endpoints`.
+- Set `default_action` deliberately. If it is omitted or invalid, cases without
+  a matching rule are reported as `UNVERIFIED`, not as a vulnerability or a
+  successful authorization check.
+- The LLM can use OpenAPI descriptions, schemas, security metadata, and policy
+  context to select useful test cases. Its interpretation does not replace the
+  configured policy as the verdict oracle. Where the contract is incomplete,
+  the LLM may add an advisory expectation hypothesis with rationale and
+  confidence; the report marks it as unverified and does not count it as a
+  finding.
+- The checked-in policy and auth configuration describe the sample API. Replace
+  them for another target, and leave `role_filter` empty to use every account
+  defined in `auth.yaml`.
+- Each `auth.yaml` entry is a distinct authentication account. `policy_role`
+  identifies its authorization role; `account_label` is its report label and
+  defaults to the account alias. Any number of configured accounts can share a
+  role. LLM planning receives this account inventory and can set `target_account`
+  for cross-account cases; it cannot invent accounts or credentials.
+- LLM planning must cover every OAS operation/account pair in the configured
+  scope. Batches split provider calls without sampling endpoints. Missing pairs
+  stop execution; the runner does not fill them with synthetic cases. Additional
+  mutations depend on operation evidence. The CLI shows operation/account coverage
+  and cases per account. Configured filters, limits and exclusions still apply.
+- Configure `user_id_json_path` for the identity returned by the target's login
+  response. Authentication identity takes precedence over resource discovery.
+- With `llm.resource_recovery_enabled`, failures with one path parameter can be
+  reviewed by the configured LLM. It reads the response, operation and observed
+  candidates, then selects an ID or stops. Selection preserves actor and target
+  owner, allows at most two retries, and is recorded with actual paths in the report.
+  Missing credentials, ambiguous ownership or genuinely absent resources cannot
+  be resolved by inventing IDs; a 404 remains unverified when recovery stops.
+- `compatibility_profile: generic` disables legacy behaviors tied to the sample
+  API. State-changing methods and configured fixtures are skipped unless
+  `execution.allow_state_changes` is enabled for an authorized test target.
 
 Optional cleanup after testing:
 

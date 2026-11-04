@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Script untuk memindahkan artifact files yang berantakan (flat) di root artifacts/
-ke struktur folder yang terorganisir berdasarkan role dan bac_type.
+Script to move scattered (flat) artifact files in the artifacts/ root
+into an organized folder structure grouped by role and bac_type.
 
-Struktur target:
+Target structure:
 artifacts/
   ├── {role}/
   │   ├── AUTH/

@@ -1,7 +1,7 @@
 from typing import List, Dict, Any, Tuple
 from collections import Counter
 from .memory import TestCase, Result
-from .utils import has_id_param, normalize_path
+from .utils import normalize_path
 import os
 from pathlib import Path
 
@@ -91,6 +91,19 @@ def _policy_allowed_endpoints(policy, role: str):
     self_only = set(role_rules.get("self_only_endpoints", []) or [])
     return allowed, denied, critical_deny, self_only
 
+
+def effective_account_alias(tc: TestCase) -> str:
+    """Return the account alias whose token is used for this test."""
+    mutation = tc.mutation or {}
+    return str(mutation.get("as_role") or tc.role)
+
+
+def effective_policy_role(policy: Dict[str, Any], tc: TestCase) -> str:
+    """Resolve an auth account alias to the backend authorization role."""
+    alias = effective_account_alias(tc)
+    role_map = (policy or {}).get("account_role_map", {}) or {}
+    return str(role_map.get(alias) or alias)
+
 def _match_endpoint_pattern(method: str, path: str, pattern: str) -> bool:
     """Return True if METHOD:path matches METHOD:/path with placeholders in pattern.
     Pattern examples: "GET:/user/{user_id}", "POST:/role/{id_role}/permissions"
@@ -121,157 +134,89 @@ def _in_endpoints(method: str, path: str, patterns: set) -> bool:
     return False
 
 
-def roles_allowed_for_endpoint(policy: Dict[str, Any], method: str, path: str) -> List[str]:
-    """
-    Return role names for which (method, path) is allowed by policy.
-    Used for critical_endpoints.csv allowed_roles so CSV reflects policy (existing condition).
-    """
-    path_norm = normalize_path(path or "")
-    rules = (policy or {}).get("rbac_rules", {}) or {}
-    # /auth/me/ is allowed for any authenticated role (current user profile)
-    if path_norm in ("/auth/me", "/auth/me/"):
-        return [r for r in rules if isinstance(rules.get(r), dict)]
-    out = []
-    for role, role_rules in rules.items():
-        if not isinstance(role_rules, dict):
-            continue
-        allowed = set(role_rules.get("allowed_endpoints", []) or [])
-        denied = set(role_rules.get("denied_endpoints", []) or [])
-        critical_deny = set(role_rules.get("critical_deny", []) or [])
-        if _in_endpoints(method, path, denied) or _in_endpoints(method, path, critical_deny):
-            continue
-        if _in_endpoints(method, path, allowed):
-            out.append(role)
-    return sorted(out)
-
-
-def _is_resource_scoped_endpoint(path: str) -> bool:
-    """
-    Detect endpoints that are resource-scoped (self-only access).
-    These endpoints should only allow access to resources owned by the authenticated user.
-    
-    Patterns detected:
-    - /attachments/{item_id}/* - Employee can only access their own attachments
-    - /change-request/{id}/* - Employee can only access their own change requests (detail endpoints)
-    
-    Returns True if the endpoint should be treated as self-only.
-    """
-    import re
-    path_lower = (path or "").lower()
-    
-    # Pattern 1: /employee/attachments/{item_id}/* endpoints
-    if re.search(r"/employee/attachments/\{[^}]*\}", path_lower):
-        return True
-    
-    # Pattern 2: Detail endpoints with specific ID parameter (not list endpoints)
-    # e.g., /employee/change-request/{id_change_request} but not /employee/change-request
-    if "/employee/" in path_lower and "{" in path_lower:
-        # Only if it's a detail endpoint (has ID parameter after the resource name)
-        if re.search(r"/change-request/\{[^}]*\}", path_lower):
-            return True
-    
-    return False
-
 def expected_status(policy, tc: TestCase) -> Dict[str, Any]:
-    # Public/auth endpoints - always accessible, can return 200 (success) or 401 (invalid/missing credentials)
-    # These endpoints should be accessible regardless of authentication state
-    public_endpoints = [
-        '/auth/login',
-        '/auth/login/',
-        '/auth/register',
-        '/auth/register/',
-        '/auth/refresh',
-        '/auth/refresh/',
-        '/auth/logout',
-        '/auth/logout/',
-        '/login',
-        '/login/',
-        '/refresh',
-        '/refresh/',
-        '/logout',
-        '/logout/',
-    ]
-    path_normalized = normalize_path(tc.path)
-    if any(path_normalized == normalize_path(pub) for pub in public_endpoints):
-        ok = _success_statuses_for_method(tc.method)
-        # Accept both 200 (success) and 401 (invalid/missing credentials) as valid for public endpoints
-        # But 403 (forbidden) is not expected for public endpoints
-        return {"status_in": ok + [401], "status_not_in": [403]}
+    """Resolve expected access from explicit policy; never infer it from URL names."""
+    policy = policy or {}
+    policy_role = effective_policy_role(policy, tc)
+    method = str(tc.method or "GET").upper()
+    path = normalize_path(tc.path)
+    success = _success_statuses_for_method(method)
 
-    # /auth/me/ returns current user profile for any authenticated role (no "self" vs "other").
-    # Expected 200; not a vulnerability when allowed.
-    if path_normalized in ("/auth/me", "/auth/me/"):
-        ok = _success_statuses_for_method(tc.method)
-        return {"status_in": ok, "status_not_in": [401, 403]}
+    def expectation(access: str, source: str) -> Dict[str, Any]:
+        if access == "allow":
+            return {"status_in": success, "status_not_in": [401, 403],
+                    "expected_access": access, "expectation_source": source}
+        if access == "deny":
+            return {"status_in": [401, 403], "status_not_in": success,
+                    "expected_access": access, "expectation_source": source}
+        return {"status_in": [], "status_not_in": [], "expected_access": "unknown",
+                "expectation_source": source}
 
-    # Format A: explicit rules with allow/deny and self semantics
-    for rule in policy.get("rules", []):
-        if rule.get("method","").upper() == tc.method.upper() and rule.get("path") == tc.path:
-            # Interpret self semantics:
-            # - self: true  -> only own resources
-            # - self: false -> other users' resources
-            # - self: "any" -> both own and others' resources
-            exp = False
-            for a in rule.get("allow", []):
-                if a.get("role") != tc.role:
-                    continue
-                sval = a.get("self")
-                if sval == "any":
-                    exp = True
-                    break
-                if tc.self_access and (sval is True):
-                    exp = True
-                    break
-                if (not tc.self_access) and (sval is False):
-                    exp = True
-                    break
-            # Deny may surface as 401/403 or 404 (not-found for other user's resource)
-            ok = _success_statuses_for_method(tc.method)
-            return {"status_in": ok, "status_not_in":[401,403,404]} if exp else {"status_in":[401,403,404], "status_not_in": ok}
-    # Format B: rbac_rules with allowed_endpoints per-role (assume self allowed, other denied)
+    # Public routes and their accepted outcomes are policy data, not URL heuristics.
+    for item in policy.get("public_endpoints", []) or []:
+        if isinstance(item, str) and ":" in item:
+            route_method, route_path = item.split(":", 1)
+            matches = route_method.strip().upper() == method and normalize_path(route_path) == path
+            allowed_statuses, denied_statuses = success + [401], [403]
+        elif isinstance(item, dict):
+            matches = str(item.get("method", "GET")).upper() == method and normalize_path(item.get("path", "")) == path
+            allowed_statuses = item.get("allow_statuses", success)
+            denied_statuses = item.get("deny_statuses", [401, 403])
+        else:
+            continue
+        if matches:
+            return {"status_in": list(allowed_statuses), "status_not_in": list(denied_statuses),
+                    "expected_access": "public", "expectation_source": "policy.public_endpoints"}
+
+    # An unauthenticated request, or one reusing a token after logout, must be
+    # denied on any non-public route regardless of the account's nominal role.
+    mutation = tc.mutation or {}
+    mutation_type = str(mutation.get("type") or "").upper()
+    if (mutation.get("no_auth") or mutation.get("without_auth")
+            or mutation_type in ("NO_AUTH", "NEGATIVE_AUTH", "JWT_AFTER_LOGOUT")):
+        return expectation("deny", "policy.unauthenticated")
+
+    # A field that only some roles may write decides the case when the request sends it.
+    sent_body = (tc.mutation or {}).get("json")
+    if isinstance(sent_body, dict):
+        for field_rule in policy.get("field_rules", []) or []:
+            if (not isinstance(field_rule, dict) or field_rule.get("field") not in sent_body
+                    or not _match_endpoint_pattern(method, path, f"{str(field_rule.get('method', '')).upper()}:{field_rule.get('path', '')}")):
+                continue
+            access = "allow" if policy_role in (field_rule.get("allow_roles") or []) else "deny"
+            return expectation(access, "policy.field_rules")
+
+    # Rules can express role access at any scope, self scope, or other-resource scope.
+    for rule in policy.get("rules", []) or []:
+        if not isinstance(rule, dict) or str(rule.get("method", "")).upper() != method:
+            continue
+        pattern = f"{method}:{rule.get('path', '')}"
+        if not _match_endpoint_pattern(method, path, pattern):
+            continue
+        grants = [grant for grant in (rule.get("allow", []) or [])
+                  if isinstance(grant, dict) and grant.get("role") == policy_role]
+        for grant in grants:
+            scope = grant.get("self", "any")
+            if scope == "any" or (scope is True and tc.self_access) or (scope is False and not tc.self_access):
+                return expectation("allow", "policy.rules")
+        return expectation("deny", "policy.rules")
+
+    # Allow/deny patterns and ownership scope are all explicit policy inputs.
     if "rbac_rules" in policy:
-        allowed, denied, critical_deny, self_only = _policy_allowed_endpoints(policy, tc.role)
-        # Fetch role permissions (if any) to infer admin-wide access
-        role_rules = (policy.get("rbac_rules", {}) or {}).get(tc.role) or {}
-        perms = set(role_rules.get("permissions", []) or [])
-        if _in_endpoints(tc.method, tc.path, critical_deny) or _in_endpoints(tc.method, tc.path, denied):
-            return {"status_in":[401,403,404], "status_not_in":[200]}
-        if _in_endpoints(tc.method, tc.path, allowed):
-            # If role has 'rbac_admin', treat access as allowed regardless of self/other for allowed endpoints
-            if "rbac_admin" in perms:
-                ok = _success_statuses_for_method(tc.method)
-                return {"status_in": ok, "status_not_in":[401,403]}
+        allowed, denied, critical_deny, self_only = _policy_allowed_endpoints(policy, policy_role)
+        if (_in_endpoints(method, path, critical_deny) or
+                _in_endpoints(method, path, denied)):
+            return expectation("deny", "policy.rbac_rules")
+        if _in_endpoints(method, path, allowed):
+            if _in_endpoints(method, path, self_only) and not tc.self_access:
+                return expectation("deny", "policy.rbac_rules.self_only_endpoints")
+            return expectation("allow", "policy.rbac_rules")
 
-            # Check if endpoint is resource-scoped (self-only access pattern)
-            is_resource_scoped = _is_resource_scoped_endpoint(tc.path)
-            # Non-admin roles: endpoints with {user_id}, {leave_id}, etc. are self-only (other → expect deny)
-            is_id_scoped = has_id_param(tc.path) and ("rbac_admin" not in perms)
-            is_self_only = _in_endpoints(tc.method, tc.path, self_only) or is_resource_scoped or is_id_scoped
+    default_action = str(policy.get("default_action", "unknown")).strip().lower()
+    if default_action in ("allow", "deny"):
+        return expectation(default_action, "policy.default_action")
+    return expectation("unknown", "no_matching_policy")
 
-            # If endpoint is not resource-owner specific (no {id}-like), allow for both self/other
-            if not has_id_param(tc.path):
-                ok = _success_statuses_for_method(tc.method)
-                return {"status_in": ok, "status_not_in":[401,403]}
-
-            # For explicitly self-scoped endpoints (or ID-scoped for non-admin):
-            # - self_access=True (baseline, own resource) → expect 200
-            # - self_access=False (IDOR, other's resource) → expect 403/404 (TN, not FP)
-            if is_self_only:
-                ok = _success_statuses_for_method(tc.method)
-                return {"status_in": ok, "status_not_in":[401,403]} if tc.self_access else {"status_in":[401,403,404], "status_not_in": ok}
-
-            # For ID-like endpoints without explicit self-only rule, do not assume deny on "other".
-            # This avoids false vulnerability labels on endpoints that are legitimately cross-resource.
-            ok = _success_statuses_for_method(tc.method)
-            return {"status_in": ok, "status_not_in":[401,403]}
-        # If endpoint not explicitly allowed or critically denied for this role,
-        # follow least-privilege: treat as denied by default.
-        ok = _success_statuses_for_method(tc.method)
-        return {"status_in":[401,403,404], "status_not_in": ok}
-    # default: unknown
-    # Conservative default: treat as denied unless explicitly allowed
-    ok = _success_statuses_for_method(tc.method)
-    return {"status_in":[401,403,404], "status_not_in": ok}
 
 def classify(exp: Dict[str, Any], actual_status: int) -> str:
     def _as_int(v, default=-1):
@@ -304,37 +249,45 @@ def classify(exp: Dict[str, Any], actual_status: int) -> str:
 
     # Input/data quality errors are inconclusive for authz labeling.
     if sc in _STATUS_RULES.get("non_finding", set([400, 409, 422])):
-        return "SKIP"
+        return "INCONCLUSIVE"
+    if (exp or {}).get("expected_access") == "public":
+        return "TP_ALLOW" if _is_2xx(sc) else "SKIP"
+    if not status_in:
+        return "UNVERIFIED"
 
     if mode == "allow":
         if _is_2xx(sc):
             return "TP_ALLOW"
         if sc in {401, 403}:
-            return "FP"
+            return "FN"
         if sc in _STATUS_RULES.get("not_found", set([404])):
             return "NOT_FOUND"
         return "SKIP"
 
     if mode == "deny":
-        if sc in {401, 403, 404}:
+        # A 404 cannot prove authorization enforcement unless resource existence
+        # was established independently. Keep it outside the confusion matrix.
+        if sc in _STATUS_RULES.get("not_found", set([404])):
+            return "NOT_FOUND"
+        if sc in {401, 403}:
             return "TN"
         if _is_2xx(sc):
-            return "FN"
+            return "FP"
         return "SKIP"
 
     # Mixed/unknown expectation fallback
+    if sc in _STATUS_RULES.get("not_found", set([404])):
+        return "NOT_FOUND"
     if sc in status_in:
         if _is_2xx(sc):
             return "TP_ALLOW"
-        if sc in {401, 403, 404}:
+        if sc in {401, 403}:
             return "TN"
         return "SKIP"
     if _is_2xx(sc) and any(s in {401, 403, 404} for s in status_in):
-        return "FN"
-    if sc in {401, 403} and any(_is_2xx(s) for s in status_in):
         return "FP"
-    if sc in _STATUS_RULES.get("not_found", set([404])):
-        return "NOT_FOUND"
+    if sc in {401, 403} and any(_is_2xx(s) for s in status_in):
+        return "FN"
     return "SKIP"
 
 def confusion_counts(results: List[Result], policy) -> Dict[str, int]:
@@ -352,6 +305,8 @@ def confusion_counts(results: List[Result], policy) -> Dict[str, int]:
         "ERR": c.get("ERROR",0),
         "NF": c.get("NOT_FOUND",0),
         "SKIP": c.get("SKIP",0),
+        "INCONCLUSIVE": c.get("INCONCLUSIVE",0),
+        "UNVERIFIED": c.get("UNVERIFIED",0),
     }
 
 def metrics(cf: Dict[str, int]) -> Dict[str, float]:
@@ -364,9 +319,11 @@ def metrics(cf: Dict[str, int]) -> Dict[str, float]:
     evaluated = TP + TN + FP + FN
     acc = (TP + TN) / max(1, evaluated)
 
-    # Security-oriented companion metrics (do not overwrite standard fields).
-    block_precision = TN / (TN + FP) if (TN + FP) > 0 else 0.0
-    block_recall = TN / (TN + FN) if (TN + FN) > 0 else 0.0
+    # Security-oriented companion metrics with DENY/BLOCK as the positive class.
+    # Conventional FN (allowed request denied) is a false block; conventional FP
+    # (denied request allowed) is a missed block.
+    block_precision = TN / (TN + FN) if (TN + FN) > 0 else 0.0
+    block_recall = TN / (TN + FP) if (TN + FP) > 0 else 0.0
     false_alarm_rate = FP / (FP + TN) if (FP + TN) > 0 else 0.0
 
     return {
@@ -388,15 +345,15 @@ def coverage(tests: List[TestCase], roles: List[str], endpoints: List[Dict[str,A
             "tested_pairs": tested_pairs, "coverage_pct": pct}
 
 def time_to_detect(results: List[Result], policy, start_ts: float) -> Dict[str, Any]:
-    """Hitung waktu hingga temuan pertama (FN) sejak start_ts.
-    Kembalikan dict dengan seconds (float) atau None, termasuk index test ke berapa (1-based).
+    """Hitung waktu hingga temuan false-allow pertama (FP) sejak start_ts.
+    Return a dict with seconds (float) or None, including the 1-based test index.
     """
     first_ts = None
     first_idx = None
     for idx, r in enumerate(results, start=1):
         exp = expected_status(policy, r.tc)
         lab = classify(exp, r.status_code)
-        if lab == "FN":
+        if lab == "FP":
             first_ts = r.ts or None
             first_idx = idx
             break
@@ -439,10 +396,5 @@ def bac_type(policy: dict, tc: TestCase) -> str:
     if mut.get("no_auth") or mut.get("without_auth") or mut_type in ("NO_AUTH", "NEGATIVE_AUTH"):
         return 'vertical'
     
-    # Authentication endpoints (login, logout, register, etc.)
-    path_lower = tc.path.lower()
-    if any(keyword in path_lower for keyword in ['/auth/', '/login', '/logout', '/register', '/signin', '/signup']):
-        return 'auth'
-    
-    # Default baseline (self access, normal operations)
+    # Do not infer a category from route names; use explicit mutation intent.
     return 'baseline'

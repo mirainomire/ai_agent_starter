@@ -7,10 +7,13 @@ class AuthManager:
     def __init__(self, http: HttpClient, auth_cfg: Dict[str, Any], openapi: Optional[Dict[str, Any]] = None):
         self.http = http
         self.cache = {}  # role -> token
+        self.authenticated_ids = {}
         self._global = auth_cfg or {}
         token_cfg = (auth_cfg or {}).get("token", {}) if isinstance(auth_cfg, dict) else {}
         # Allow ENV override for token JSON path
         env_token_path = os.getenv("TOKEN_JSON_PATH")
+        # FALLBACK CHAIN: environment -> auth config -> conventional response path.
+        # The final literal is schema-dependent and may not match every target API.
         self.token_json_path_default = env_token_path or token_cfg.get("token_json_path") or "token.access_token"
         self.openapi = openapi or {}
         # Optional separate base_url for auth endpoints
@@ -56,6 +59,8 @@ class AuthManager:
                     continue
                 parsed[name] = {
                     "name": name,
+                    "policy_role": val.get("policy_role") or name,
+                    "account_label": val.get("account_label") or name,
                     "flow": val.get("flow", "password"),
                     "endpoint": val.get("login_endpoint") or val.get("endpoint", "/auth/login"),
                     "payload": {
@@ -63,16 +68,27 @@ class AuthManager:
                         "username": (val.get("credentials") or {}).get("username") or (val.get("credentials") or {}).get("email"),
                         "password": (val.get("credentials") or {}).get("password"),
                         # Best-effort synthetic user_id if not provided
-                        "user_id": self._default_user_id(name),
+                        "user_id": val.get("user_id") or (val.get("credentials") or {}).get("user_id"),
                     },
                     # Try typical paths if not specified
                     "token_json_path": val.get("token_json_path") or "token.access_token",
                     # Preferred user field name for this role (username/email)
                     "user_field": val.get("user_field") or self._global.get("user_field") or None,
+                    "user_id_json_path": val.get("user_id_json_path"),
                 }
         else:
             parsed = {}
         self.roles = parsed
+
+    def get_policy_role(self, account_alias: str) -> str:
+        """Return the authorization role represented by an auth account alias."""
+        info = self.roles.get(account_alias) or {}
+        return str(info.get("policy_role") or account_alias)
+
+    def get_account_label(self, account_alias: str) -> str:
+        """Return a non-secret human-readable account label for reporting."""
+        info = self.roles.get(account_alias) or {}
+        return str(info.get("account_label") or account_alias)
 
     def get_token(self, role: str) -> str:
         if role in self.cache:
@@ -117,19 +133,25 @@ class AuthManager:
             # Diagnostics: record credential source (without values)
             used_env_user = bool(env_user)
             used_env_pass = bool(env_pass)
+            # Body encoding follows the OpenAPI login operation (JSON by default,
+            # form when the spec declares x-www-form-urlencoded/multipart only).
+            login_content_type = self._login_content_type(info.get("endpoint"))
+            login_kwargs = {"data": payload} if login_content_type == "form" else {"json_body": payload}
             resp = self.http_login.request(
-                "POST", ep, token=None, json_body=payload,
+                "POST", ep, token=None,
                 role=f"Auth_{role}", bac_type="auth",
                 test_context={
                     "login_role": role,
                     "payload_keys": list(payload.keys()),
+                    "login_content_type": login_content_type,
                     "creds_source": {
                         "user_from_env": used_env_user,
                         "pass_from_env": used_env_pass,
                         "user_field": user_field,
                         "pass_field": pass_field,
                     }
-                }
+                },
+                **login_kwargs,
             )
             # If login failed, raise early with context
             try:
@@ -144,6 +166,10 @@ class AuthManager:
             except Exception:
                 pass
             body = resp.get("body", {})
+            identity_path = info.get("user_id_json_path") or self._global.get("user_id_json_path")
+            identity = self._extract(body, identity_path)
+            if isinstance(identity, int) and not isinstance(identity, bool) and identity > 0:
+                self.authenticated_ids[role] = identity
             # Try multiple common locations
             # Role-specific env override e.g., ADMIN_HC_TOKEN_JSON_PATH
             role_token_path = os.getenv(f"{self._env_key_base(role)}_TOKEN_JSON_PATH")
@@ -196,6 +222,8 @@ class AuthManager:
         return token
 
     def get_user_id(self, role: str) -> Optional[int]:
+        if role in self.authenticated_ids:
+            return self.authenticated_ids[role]
         # Prefer explicit env override
         env_uid = self._env_user_id_for_role(role)
         if isinstance(env_uid, int) and env_uid > 0:
@@ -224,7 +252,9 @@ class AuthManager:
 
     @staticmethod
     def _default_user_id(role: str) -> int:
-        # Simple mapping to keep self vs other scenarios stable in dry-run
+        # HARDCODED DRY-RUN FIXTURES ONLY:
+        # These synthetic IDs make self/other scenarios deterministic without live
+        # discovery. get_user_id() deliberately avoids them during live execution.
         if role.lower().startswith("admin"):
             return 1
         if role.lower().startswith("employee_2"):
@@ -240,7 +270,9 @@ class AuthManager:
 
     def _env_credentials_for_role(self, role: str):
         base = self._env_key_base(role)
-        # Common fallbacks for well-known roles
+        # HARDCODED COMPATIBILITY ALIASES:
+        # Keep legacy ADMIN_* / EMPLOYEE_* environment names working. New roles use
+        # the generic <NORMALIZED_ROLE>_USERNAME/PASSWORD convention above.
         fallback_map = {
             "ADMIN_HC": ("ADMIN_USERNAME", "ADMIN_PASSWORD"),
             "EMPLOYEE": ("EMPLOYEE_USERNAME", "EMPLOYEE_PASSWORD"),
@@ -318,6 +350,27 @@ class AuthManager:
             return schema
         except Exception:
             return None
+
+    def _login_content_type(self, path: Optional[str], method: str = "post") -> str:
+        """Pick the login body encoding from the OpenAPI operation.
+
+        Defaults to JSON (legacy behaviour). Only returns 'form' when the spec
+        declares a form body and no JSON body, so APIs using OAuth2 password
+        flow / x-www-form-urlencoded authenticate without per-API code changes.
+        """
+        try:
+            p = str(path or "").strip()
+            if p and not p.startswith("/"):
+                p = "/" + p
+            node = ((self.openapi or {}).get("paths", {}).get(p, {}) or {}).get(method.lower()) or {}
+            content = (node.get("requestBody") or {}).get("content", {}) or {}
+            if "application/json" in content:
+                return "json"
+            if "application/x-www-form-urlencoded" in content or "multipart/form-data" in content:
+                return "form"
+        except Exception:
+            pass
+        return "json"
 
     def _infer_user_field_from_openapi(self, path: Optional[str]) -> Optional[str]:
         schema = self._openapi_schema_for(path, 'post')

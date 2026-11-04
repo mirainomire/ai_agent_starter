@@ -12,8 +12,6 @@ class HttpClient:
         self.dry_run = dry_run
         self.token_header = token_header or "Authorization"
         self.token_type = token_type or "Bearer"
-        # Cache for live value discovery from API lists.
-        self._value_probe_cache: Dict[str, Any] = {}
         pathlib.Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
         self.session = None if dry_run else requests.Session()
 
@@ -67,10 +65,10 @@ class HttpClient:
             # Determine subfolder based on BAC type, mapped to expected labels
             bt = (bac_type or "baseline").strip().lower()
             label = (
-                "IDOR" if bt == "horizontal" else
-                "BOLA" if bt == "vertical" else
-                "AUTH" if bt == "auth" else
-                "BASELINE"
+                "cross_principal" if bt == "horizontal" else
+                "role_scope" if bt == "vertical" else
+                "authentication" if bt == "auth" else
+                "baseline"
             )
             
             # Optional target label (e.g., to_admin, to_employee, to_same_role)
@@ -172,7 +170,7 @@ class HttpClient:
         return _mask_recursive(data)
 
     def request(self, method: str, path: str, token: Optional[str], params=None, json_body=None, extra_headers: Optional[Dict[str, str]] = None, 
-                role: str = None, bac_type: str = None, test_context: Dict[str, Any] = None) -> Dict[str, Any]:
+                role: str = None, bac_type: str = None, test_context: Dict[str, Any] = None, data=None) -> Dict[str, Any]:
         """
         Execute HTTP request and save artifact with organized structure.
         
@@ -229,13 +227,19 @@ class HttpClient:
         while attempt <= self.retries:
             try:
                 if self.dry_run:
-                    # Simulasi respons saat dry_run
+                    # HARDCODED DRY-RUN SENTINEL:
+                    # HTTP 418 is intentionally non-successful so simulated traffic
+                    # cannot be mistaken for a real authorization result.
                     resp = {"status_code": 418, "body": {"dry_run": True, "url": url}}
                 else:
                     sess = self.session or requests
-                    r = sess.request(method.upper(), url, headers=headers, params=params, json=json_body, timeout=self.timeout_s)
+                    if data is not None:
+                        # Form-encoded body (application/x-www-form-urlencoded); requests sets the header.
+                        r = sess.request(method.upper(), url, headers=headers, params=params, data=data, timeout=self.timeout_s)
+                    else:
+                        r = sess.request(method.upper(), url, headers=headers, params=params, json=json_body, timeout=self.timeout_s)
                     resp = {"status_code": r.status_code, "body": self._safe_json(r)}
-                # Simpan artefak dengan struktur terorganisir
+                # Save the artifact with an organized structure
                 ts = int(time.time()*1000)
                 # Human-friendly UTC time for logs (DD-MM-YYYY HH:MM)
                 from datetime import datetime, timezone
@@ -268,10 +272,7 @@ class HttpClient:
                         if isinstance(mut_role, str) and _norm(mut_role) and _norm(mut_role) != _norm(original_role):
                             target_label = f"to_{_norm(mut_role)}"
                         else:
-                            # Infer from path for common admin-ish areas
-                            pl = path.lower()
-                            adminish = any(k in pl for k in ['/role', '/roles', '/permission', '/permissions', '/users', '/user/', '/rbac', '/admin'])
-                            target_label = 'to_admin' if adminish else 'to_unknown'
+                            target_label = 'to_unknown'
                 except Exception:
                     target_label = None
 
@@ -306,8 +307,7 @@ class HttpClient:
                         "bac_type": bac_type,
                         "timestamp": ts,
                         "timestamp_str": ts_str,
-                        # Convenience combined label (e.g., "employee (BOLA)") for human scanning
-                        "folder_label": f"{(role or '').strip().lower().replace(' ','_').replace('-','_')} (" + ("IDOR" if str(bac_type).lower()=="horizontal" else "BOLA" if str(bac_type).lower()=="vertical" else "AUTH" if str(bac_type).lower()=="auth" else "BASELINE") + ")",
+                        "folder_label": f"{(role or '').strip().lower().replace(' ','_').replace('-','_')} ({bac_type or 'baseline'})",
                         "artifact_path": artifact_full_path,
                         "test_context": test_context or {}
                     }
@@ -319,8 +319,9 @@ class HttpClient:
                 resp["artifact"] = artifact_full_path
                 return resp
             except Exception as e:
-                # Common local-dev mismatch: HTTPS sent to HTTP-only dev server.
-                # If it happens on localhost/127.0.0.1, downgrade once and retry.
+                # FALLBACK KHUSUS LOCAL DEVELOPMENT:
+                # Downgrade HTTPS -> HTTP only for localhost/127.0.0.1. Never
+                # broaden this host allow-list because that would weaken TLS.
                 try:
                     emsg = str(e)
                     parsed = urlsplit(url)
@@ -383,38 +384,11 @@ class HttpClient:
         payload_generated = False
         original_body = json_body
         schema_info = None
+        if method.upper() in ('POST', 'PUT', 'PATCH'):
+            schema_info = extract_request_schema(openapi, method, path)
         
-        # Special handling for /auth/login - inject real credentials from .env
-        if path.rstrip('/').endswith('/auth/login') and method.upper() == 'POST':
-            if role:
-                username, password = self._role_credentials_from_env(role)
-                if username and password:
-                    # Inject credentials with field names that match schema when possible.
-                    if json_body is None:
-                        json_body = {}
-                    if isinstance(json_body, dict):
-                        # Inspect schema to decide whether backend expects username or email.
-                        login_schema = extract_request_schema(openapi, method, path) or {}
-                        required = set(login_schema.get('required') or [])
-                        props = set((login_schema.get('properties') or {}).keys())
-                        want_email = ('email' in required) or ('email' in props and 'username' not in required)
-                        want_username = ('username' in required) or ('username' in props and 'email' not in required)
-                        if want_username:
-                            json_body['username'] = username
-                        if want_email:
-                            json_body['email'] = username
-                        # Fallback: set both if schema is unclear.
-                        if not want_username and not want_email:
-                            json_body['username'] = username
-                            json_body['email'] = username
-                        json_body['password'] = password
-                        payload_generated = True
-                        print(f"[AUTH] Injected credentials for role {role}: {username}")
-        
-        # Endpoints that should skip smart payload generation
-        skip_endpoints = ['/auth/login', '/auth/register', '/auth/refresh', '/auth/logout']
-        should_skip = any(path.rstrip('/').endswith(endpoint.rstrip('/')) for endpoint in skip_endpoints)
-        
+        should_skip = False
+
         # DEBUG: Check conditions
         # Auto-generate payload for methods that typically require body (but skip auth endpoints)
         if json_body is None and method.upper() in ('POST', 'PUT', 'PATCH') and not should_skip:
@@ -422,12 +396,12 @@ class HttpClient:
             
             # extract_request_schema returns wrapper with 'schema' key for the actual schema
             actual_schema = schema_info.get('schema', schema_info) if isinstance(schema_info, dict) else {}
-            has_content = bool(actual_schema and (actual_schema.get('properties') or actual_schema.get('items') or actual_schema.get('type')))
+            has_content = bool(actual_schema and (actual_schema.get('properties') or actual_schema.get('items') or actual_schema.get('type'))) or schema_info.get('example') is not None
             
             # Generate payload if we have usable schema
             if has_content:
-                # Pass actual schema to generator, not the wrapper
-                json_body = generate_payload_from_schema(actual_schema, discovered_ids)
+                # Preserve media-level examples alongside the resolved schema.
+                json_body = generate_payload_from_schema(schema_info, discovered_ids)
                 payload_generated = True
                 # Only print compact message
                 schema_type = actual_schema.get('type', 'object')
@@ -460,20 +434,6 @@ class HttpClient:
                             # Replace missing/synthetic values with discovered resource IDs.
                             if fv is None or (isinstance(fv, int) and fv <= 1):
                                 json_body[fk] = rid
-                # Payroll uniqueness guard:
-                # avoid duplicate (user_id, month, year) combinations before POST /payroll.
-                if isinstance(json_body, dict):
-                    self._ensure_payroll_unique_period(
-                        method=method,
-                        path=path,
-                        json_body=json_body,
-                        token=token,
-                        role=role,
-                        bac_type=bac_type,
-                        test_context=test_context,
-                        attempt=attempt,
-                    )
-
                 response = self.request(
                     method=method,
                     path=path,
@@ -488,19 +448,9 @@ class HttpClient:
                 
                 last_response = response
                 status_code = response.get('status_code', 0)
-                err_text = self._error_text_from_response(response)
-                
+
                 # Success or non-400 error - return immediately
                 if status_code != 400:
-                    # Retry once with rotated period on known payroll unique conflict.
-                    if (
-                        attempt < max_retries
-                        and self._is_payroll_unique_conflict(method, path, status_code, err_text)
-                        and isinstance(json_body, dict)
-                    ):
-                        self._bump_payroll_period(json_body, step=max(1, attempt + 1))
-                        attempt += 1
-                        continue
                     response['payload_info'] = {
                         'auto_generated': payload_generated,
                         'original_body': original_body,
@@ -512,6 +462,9 @@ class HttpClient:
                 
                 # Got 400 - try to improve payload if we haven't exhausted retries
                 if attempt < max_retries:
+                    if self._repair_unique_conflict(method, json_body, response.get('body'), schema_info):
+                        attempt += 1
+                        continue
                     # Analyze error message
                     error_body = response.get('body', {})
                     error_msg = str(error_body.get('message') or error_body.get('detail') or '').lower()
@@ -530,18 +483,6 @@ class HttpClient:
                             schema_props = {}
                             if isinstance(schema_info, dict):
                                 schema_props = schema_info.get('properties') or {}
-                            # Try live API discovery first (best effort), then schema defaults.
-                            discovered_val = self._discover_field_value_via_api(
-                                field_name=rf,
-                                token=token,
-                                role=role,
-                                bac_type=bac_type,
-                                test_context=test_context,
-                            )
-                            if discovered_val is not None:
-                                json_body[rf] = discovered_val
-                                changed = True
-                                continue
                             json_body[rf] = self._default_for_required_field(
                                 rf,
                                 schema_props.get(rf) or {},
@@ -564,14 +505,6 @@ class HttpClient:
                                 else:
                                     rid = self._resolve_discovered_id_for_field(missing_field, discovered_ids or {})
                                 json_body[missing_field] = rid if isinstance(rid, int) and rid > 0 else 1
-                            elif (live_val := self._discover_field_value_via_api(
-                                field_name=missing_field,
-                                token=token,
-                                role=role,
-                                bac_type=bac_type,
-                                test_context=test_context,
-                            )) is not None:
-                                json_body[missing_field] = live_val
                             elif 'email' in missing_field.lower():
                                 json_body[missing_field] = "test@example.com"
                             elif 'name' in missing_field.lower():
@@ -579,6 +512,8 @@ class HttpClient:
                             elif 'status' in missing_field.lower():
                                 json_body[missing_field] = "active"
                             else:
+                                # HARDCODED LAST RESORT: this placeholder only makes
+                                # an inconclusive request possible; it is not domain-valid data.
                                 json_body[missing_field] = "default_value"
                             
                             # Retry with updated payload
@@ -605,31 +540,6 @@ class HttpClient:
         
         return last_response or {'status_code': 0, 'body': {}, 'error': 'No response received'}
     
-    @staticmethod
-    def _env_key_base(role_name: str) -> str:
-        s = str(role_name or "").strip().upper()
-        s = "".join(ch if ch.isalnum() else "_" for ch in s)
-        while "__" in s:
-            s = s.replace("__", "_")
-        return s.strip("_")
-
-    @classmethod
-    def _role_credentials_from_env(cls, role_name: str) -> tuple[Optional[str], Optional[str]]:
-        """
-        Resolve role credentials without hardcoded role names.
-        Supports:
-        - <ROLE>_USERNAME + <ROLE>_PASSWORD
-        - <ROLE>_EMAIL + <ROLE>_PASSWORD
-        """
-        base = cls._env_key_base(role_name)
-        if not base:
-            return None, None
-        username = os.getenv(f"{base}_USERNAME")
-        email = os.getenv(f"{base}_EMAIL")
-        password = os.getenv(f"{base}_PASSWORD")
-        identity = username or email
-        return identity, password
-
     @staticmethod
     def _default_for_required_field(
         field_name: str,
@@ -674,6 +584,8 @@ class HttpClient:
                 return _dt.date.today().year
             if "month" in name:
                 return 1
+            # HARDCODED LAST RESORT: prefer discovered IDs/schema examples. Value 1
+            # may reference real data and must not be treated as a safe fixture.
             return 1
         if ftype == "boolean":
             return False
@@ -695,6 +607,7 @@ class HttpClient:
             return []
         if ftype == "object":
             return {}
+        # HARDCODED LAST RESORT for an unknown string-like required field.
         return "default_value"
 
     @staticmethod
@@ -721,121 +634,46 @@ class HttpClient:
         return None
     
     @staticmethod
-    def _extract_list_items(body: Any) -> list[dict]:
-        """Extract list items from common API response envelopes."""
-        try:
-            if isinstance(body, list):
-                return [x for x in body if isinstance(x, dict)]
-            if not isinstance(body, dict):
-                return []
-            candidates = [
-                ["data", "items"],
-                ["data", "results"],
-                ["data", "list"],
-                ["items"],
-                ["results"],
-                ["list"],
-                ["data"],
-            ]
-            for keys in candidates:
-                cur = body
-                ok = True
-                for k in keys:
-                    if isinstance(cur, dict) and k in cur:
-                        cur = cur[k]
-                    else:
-                        ok = False
-                        break
-                if ok and isinstance(cur, list):
-                    return [x for x in cur if isinstance(x, dict)]
-            return []
-        except Exception:
-            return []
-
-    def _discover_field_value_via_api(
-        self,
-        field_name: str,
-        token: Optional[str],
-        role: Optional[str],
-        bac_type: Optional[str],
-        test_context: Optional[Dict[str, Any]],
-    ) -> Any:
-        """
-        Discover a plausible field value by calling list endpoints.
-        Example: role_name -> GET /roles, user_id -> GET /users.
-        """
-        try:
-            f = str(field_name or "").strip().lower()
-            if not f:
-                return None
-            cache_key = f
-            if cache_key in self._value_probe_cache:
-                return self._value_probe_cache.get(cache_key)
-
-            endpoint_candidates: list[str] = []
-            if "user" in f or f in ("id_user", "user_id"):
-                endpoint_candidates.extend(["/users", "/user"])
-            if "role" in f:
-                endpoint_candidates.extend(["/roles", "/role"])
-            if "permission" in f:
-                endpoint_candidates.extend(["/permissions", "/permission"])
-            if "employee" in f:
-                endpoint_candidates.extend(["/employees", "/employee", "/users"])
-            if "department" in f:
-                endpoint_candidates.extend(["/departments", "/department"])
-
-            # Deduplicate while preserving order.
-            seen = set()
-            endpoint_candidates = [p for p in endpoint_candidates if not (p in seen or seen.add(p))]
-            if not endpoint_candidates:
-                return None
-
-            for ep in endpoint_candidates:
-                try:
-                    resp = self.request(
-                        method="GET",
-                        path=ep,
-                        token=token,
-                        params=None,
-                        json_body=None,
-                        extra_headers=None,
-                        role=role,
-                        bac_type=bac_type or "discovery",
-                        test_context=test_context or {},
-                    )
-                    if int(resp.get("status_code") or 0) // 100 != 2:
-                        continue
-                    items = self._extract_list_items(resp.get("body"))
-                    if not items:
-                        continue
-                    first = items[0]
-                    if not isinstance(first, dict):
-                        continue
-
-                    # ID fields
-                    if "id" in f:
-                        for k in ("id", "user_id", "id_user", "role_id", "permission_id"):
-                            v = first.get(k)
-                            if isinstance(v, int) and v > 0:
-                                self._value_probe_cache[cache_key] = v
-                                return v
-                        for k, v in first.items():
-                            if isinstance(k, str) and "id" in k.lower() and isinstance(v, int) and v > 0:
-                                self._value_probe_cache[cache_key] = v
-                                return v
-
-                    # Name/code fields
-                    if "name" in f or "code" in f or "role" in f or "permission" in f:
-                        for k in ("name", "role_name", "permission_name", "code", "slug", "title"):
-                            v = first.get(k)
-                            if isinstance(v, str) and v.strip():
-                                self._value_probe_cache[cache_key] = v.strip()
-                                return v.strip()
-                except Exception:
-                    continue
-        except Exception:
-            return None
-        return None
+    def _repair_unique_conflict(method, payload, body, schema_info):
+        """Repair only fields explicitly rejected as duplicates by the API."""
+        import re
+        import uuid
+        if not isinstance(payload, dict) or not isinstance(body, dict):
+            return False
+        schema = (schema_info or {}).get('schema', {})
+        properties = schema.get('properties', {})
+        required = schema.get('required', [])
+        details = body.get('details') or body.get('errors') or body
+        message = ' '.join(str(body.get(k, '')) for k in ('error', 'detail', 'message'))
+        changed = False
+        for field in list(payload):
+            field_error = details.get(field, '') if isinstance(details, dict) else ''
+            if not field_error and re.search(r'\b' + re.escape(field) + r'\b', message, re.I):
+                field_error = message
+            if not re.search(r'already exists|duplicate|must be unique', str(field_error), re.I):
+                continue
+            prop = properties.get(field)
+            if not isinstance(prop, dict):
+                continue
+            if method.upper() in ('PUT', 'PATCH') and field not in required:
+                del payload[field]
+                changed = True
+                continue
+            value = payload[field]
+            if not isinstance(value, str) or prop.get('enum') or prop.get('pattern'):
+                continue
+            suffix = uuid.uuid4().hex[:10]
+            limit = int(prop.get('maxLength', max(64, len(value) + 11)))
+            tail = ''
+            if prop.get('format') == 'email' and '@' in value:
+                value, domain = value.rsplit('@', 1)
+                tail = '@' + domain
+            room = limit - len(tail) - len(suffix) - 1
+            if room < 1:
+                continue
+            payload[field] = value[:room] + '_' + suffix + tail
+            changed = True
+        return changed
 
     @staticmethod
     def _error_text_from_response(response: Dict[str, Any]) -> str:
@@ -853,157 +691,6 @@ class HttpClient:
             return str(body).lower()
         except Exception:
             return ""
-
-    @staticmethod
-    def _is_payroll_unique_conflict(method: str, path: str, status_code: int, err_text: str) -> bool:
-        try:
-            if str(method or "").upper() != "POST":
-                return False
-            p = str(path or "").lower().rstrip("/")
-            if not p.endswith("/payroll"):
-                return False
-            text = str(err_text or "").lower()
-            if "unique constraint failed" in text and "payrolls.user_id" in text:
-                return True
-            if status_code in (409, 422) and ("unique" in text or "already exists" in text or "duplicate" in text):
-                return True
-            # Some backends return 500 for uncaught IntegrityError.
-            if status_code >= 500 and ("integrityerror" in text or "unique" in text):
-                return True
-            return False
-        except Exception:
-            return False
-
-    def _ensure_payroll_unique_period(
-        self,
-        method: str,
-        path: str,
-        json_body: Dict[str, Any],
-        token: Optional[str],
-        role: Optional[str],
-        bac_type: Optional[str],
-        test_context: Optional[Dict[str, Any]],
-        attempt: int = 0,
-    ) -> None:
-        """
-        Ensure POST /payroll has a non-colliding (month, year) for the selected user_id.
-        """
-        try:
-            if str(method or "").upper() != "POST":
-                return
-            p = str(path or "").lower().rstrip("/")
-            if not p.endswith("/payroll"):
-                return
-            user_id = json_body.get("user_id")
-            if not isinstance(user_id, int) or user_id <= 0:
-                return
-
-            existing = self._fetch_existing_payroll_periods(
-                user_id=user_id,
-                token=token,
-                role=role,
-                bac_type=bac_type,
-                test_context=test_context,
-            )
-            if not existing:
-                return
-
-            # Normalize month/year defaults if absent.
-            month = json_body.get("month")
-            year = json_body.get("year")
-            import datetime as _dt
-            today = _dt.date.today()
-            if not isinstance(month, int) or not (1 <= month <= 12):
-                month = today.month
-            if not isinstance(year, int) or year < 2000:
-                year = today.year
-
-            # Rotate candidate to avoid existing tuples.
-            cand_month = month
-            cand_year = year
-            for shift in range(attempt, attempt + 48):
-                m = ((cand_month - 1 + shift) % 12) + 1
-                y = cand_year + ((cand_month - 1 + shift) // 12)
-                if (m, y) not in existing:
-                    json_body["month"] = m
-                    json_body["year"] = y
-                    return
-        except Exception:
-            return
-
-    def _fetch_existing_payroll_periods(
-        self,
-        user_id: int,
-        token: Optional[str],
-        role: Optional[str],
-        bac_type: Optional[str],
-        test_context: Optional[Dict[str, Any]],
-    ) -> set[tuple[int, int]]:
-        """
-        Read existing payroll tuples for a user from GET /payroll list endpoint.
-        """
-        cache_key = f"payroll_periods_user_{int(user_id)}"
-        cached = self._value_probe_cache.get(cache_key)
-        if isinstance(cached, set):
-            return cached
-        out: set[tuple[int, int]] = set()
-        try:
-            resp = self.request(
-                method="GET",
-                path="/payroll",
-                token=token,
-                params=None,
-                json_body=None,
-                extra_headers=None,
-                role=role,
-                bac_type=bac_type or "discovery",
-                test_context=test_context or {},
-            )
-            if int(resp.get("status_code") or 0) // 100 != 2:
-                self._value_probe_cache[cache_key] = out
-                return out
-            items = self._extract_list_items(resp.get("body"))
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                uid = it.get("user_id")
-                # Some APIs nest user object.
-                if uid is None and isinstance(it.get("user"), dict):
-                    uid = it.get("user", {}).get("id")
-                try:
-                    uid_i = int(uid)
-                except Exception:
-                    continue
-                if uid_i != int(user_id):
-                    continue
-                try:
-                    m = int(it.get("month"))
-                    y = int(it.get("year"))
-                    if 1 <= m <= 12 and y >= 2000:
-                        out.add((m, y))
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        self._value_probe_cache[cache_key] = out
-        return out
-
-    @staticmethod
-    def _bump_payroll_period(json_body: Dict[str, Any], step: int = 1) -> None:
-        try:
-            import datetime as _dt
-            month = json_body.get("month")
-            year = json_body.get("year")
-            today = _dt.date.today()
-            if not isinstance(month, int) or not (1 <= month <= 12):
-                month = today.month
-            if not isinstance(year, int) or year < 2000:
-                year = today.year
-            idx = (month - 1) + max(1, int(step))
-            json_body["month"] = (idx % 12) + 1
-            json_body["year"] = year + (idx // 12)
-        except Exception:
-            return
 
     @staticmethod
     def _resolve_discovered_id_for_field(field_name: str, discovered_ids: Dict[str, Any]) -> Optional[int]:

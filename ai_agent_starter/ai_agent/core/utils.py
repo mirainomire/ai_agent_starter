@@ -23,10 +23,13 @@ def normalize_path(path: str) -> str:
     return s
 
 def extract_paths_from_openapi(spec: Dict[str, Any]) -> List[dict]:
+    http_methods = {"GET", "PUT", "POST", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"}
     paths = []
     for p, methods in spec.get("paths", {}).items():
         for m, meta in methods.items():
-            paths.append({"method": m.upper(), "path": normalize_path(p)})
+            method = str(m).upper()
+            if method in http_methods and isinstance(meta, dict):
+                paths.append({"method": method, "path": normalize_path(p)})
     return paths
 
 def has_id_param(path: str) -> bool:
@@ -39,12 +42,39 @@ def has_id_param(path: str) -> bool:
             return True
     return False
 
+
+def resource_id_field(item, placeholder, collection):
+    """Bind the requested parameter, not an unrelated record's primary key."""
+    if not isinstance(item, dict):
+        return None, None
+    base = re.sub(r'(^id_|_id$)', '', placeholder)
+    keys = [placeholder, base + '_id', 'id_' + base]
+    resource = normalize_path(collection).rstrip('/').split('/')[-1].rstrip('s')
+    if placeholder == 'id' or (base and resource.startswith(base)):
+        keys.append('id')
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return key, value
+    return None, None
+
 def load_policy(config_dir: str) -> dict:
     """Load canonical policy from YAML only."""
     ypath = os.path.join(config_dir, "policy.yaml")
-    if os.path.exists(ypath):
-        return load_yaml(ypath)
-    raise FileNotFoundError(f"No policy file found in {config_dir} (required: policy.yaml)")
+    if not os.path.exists(ypath):
+        raise FileNotFoundError(f"No policy file found in {config_dir} (required: policy.yaml)")
+    policy = load_yaml(ypath) or {}
+    if policy.get("catalog"):
+        from .catalog_policy import loadCatalogPolicy
+        auth_path = os.path.join(config_dir, "auth.yaml")
+        auth_roles = ((load_yaml(auth_path) or {}).get("roles") or {}) if os.path.exists(auth_path) else {}
+        account_roles = {
+            alias: str(spec.get("policy_role"))
+            for alias, spec in auth_roles.items()
+            if isinstance(spec, dict) and spec.get("policy_role")
+        }
+        policy = loadCatalogPolicy(policy, Path(config_dir).parent, account_roles)
+    return policy
 
 def endpoints_from_policy(policy: Dict[str, Any]) -> List[dict]:
     """Collect unique METHOD:/path from rbac_rules (allowed_endpoints + critical_deny) across roles."""
@@ -106,7 +136,7 @@ def load_endpoints_config(config_dir: str) -> List[dict]:
     return items
 
 def load_rbac_matrix():
-    """Load flattened RBAC matrix untuk LLM"""
+    """Load the flattened RBAC matrix for the LLM"""
     return pd.read_csv(DATA_DIR / "rbac_matrix.csv")
 
 def load_roles():
@@ -118,13 +148,21 @@ def load_permissions():
     return pd.read_csv(DATA_DIR / "permissions.csv")
 
 def get_role_permissions(role_name: str) -> list:
-    """Get list permission codes untuk role tertentu"""
-    df = load_rbac_matrix()
-    perms = df[df['role_name'] == role_name]['permission_code'].tolist()
-    return perms
+    """Get the list of permission codes for a given role"""
+    roles = load_roles()
+    permissions = load_permissions()
+    mapping = pd.read_csv(DATA_DIR / "role_permission.csv")
+    role_rows = roles[roles["role_name"].str.lower() == str(role_name).lower()]
+    if role_rows.empty:
+        return []
+    role_id = role_rows.iloc[0]["role_id"]
+    permission_ids = mapping[mapping["role_id"] == role_id]["permission_id"]
+    return permissions[permissions["permission_id"].isin(permission_ids)][
+        "permission_code"
+    ].tolist()
 
 def get_all_roles() -> list:
-    """Get list semua role names"""
+    """Get the list of all role names"""
     return load_roles()['role_name'].tolist()
 
 def extract_request_schema(openapi: Dict[str, Any], method: str, path: str) -> Dict[str, Any]:
@@ -209,17 +247,19 @@ def extract_request_schema(openapi: Dict[str, Any], method: str, path: str) -> D
                 if isinstance(pv, dict) and '$ref' in pv:
                     schema['properties'][pk] = _resolve_ref(pv)
 
+        # Named examples contain Example Objects; use their value as the body.
+        example = media.get('example')
+        if example is None:
+            for item in (media.get('examples') or {}).values():
+                item = _resolve_ref(item)
+                if 'value' in item:
+                    example = item['value']
+                    break
+        if example is None:
+            example = schema.get('example')
+
         # If no schema, try infer from example(s)
         if not schema or not schema.get('properties'):
-            example = media.get('example', {})
-            if not example and 'examples' in media:
-                examples_obj = media.get('examples', {})
-                if isinstance(examples_obj, dict) and examples_obj:
-                    first_key = next(iter(examples_obj), None)
-                    ex_item = examples_obj.get(first_key) if first_key else None
-                    if isinstance(ex_item, dict):
-                        example = ex_item.get('value', {})
-
             if example and isinstance(example, dict):
                 schema = {'type': 'object', 'properties': {}, 'required': list(example.keys())}
                 for key, value in example.items():
@@ -240,7 +280,7 @@ def extract_request_schema(openapi: Dict[str, Any], method: str, path: str) -> D
             'schema': schema if isinstance(schema, dict) else {},
             'required': (schema.get('required', []) if isinstance(schema, dict) else []),
             'properties': (schema.get('properties', {}) if isinstance(schema, dict) else {}),
-            'example': media.get('example') or media.get('examples', {})
+            'example': example
         }
     except Exception:
         return {}
@@ -273,6 +313,13 @@ def generate_payload_from_schema(schema_info: Dict[str, Any], discovered_ids: Di
         # Direct format: {'type': '...', 'properties': {}, ...}
         actual_schema = schema_info
     
+    from copy import deepcopy
+    example = schema_info.get('example')
+    if example is None:
+        example = actual_schema.get('example')
+    if example is not None and not isinstance(example, dict):
+        return deepcopy(example)
+
     # Handle ARRAY schemas
     if schema_type == 'array':
         items_schema = actual_schema.get('items', {})
@@ -286,17 +333,16 @@ def generate_payload_from_schema(schema_info: Dict[str, Any], discovered_ids: Di
             return [default_item]
     
     # Handle OBJECT schemas (original logic)
-    if not schema_info.get('properties') and not actual_schema.get('properties'):
+    if not actual_schema.get('properties') and not isinstance(example, dict):
         return {}
     
-    schema = schema_info.get('schema', {})
-    required_fields = schema_info.get('required', [])
-    properties = schema_info.get('properties', {})
+    required_fields = actual_schema.get('required', [])
+    properties = actual_schema.get('properties', {})
     
     # Start with example if available
     payload = {}
-    if schema_info.get('example') and isinstance(schema_info['example'], dict):
-        payload = dict(schema_info['example'])
+    if isinstance(example, dict):
+        payload = deepcopy(example)
     
     # Generate values for required fields
     for field_name in required_fields:

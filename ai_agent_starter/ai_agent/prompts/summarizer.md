@@ -17,8 +17,8 @@ You are an expert security consultant analyzing the results of an automated Brok
 
 - TP (True Positives - Allowed endpoints working correctly): {tp}
 - TN (True Negatives - Denied endpoints blocked correctly): {tn}
-- FP (False Positives - Allowed endpoints incorrectly denied): {fp}
-- FN (False Negatives - **VULNERABILITIES DETECTED**): {fn}
+- FP (False Positives / false allows - **VULNERABILITIES DETECTED**): {fp}
+- FN (False Negatives / false denials - allowed endpoints incorrectly denied): {fn}
 - ERR (System Errors - 5xx responses): {err}
 - NF (Not Found - 404 responses): {nf}
 
@@ -47,16 +47,16 @@ Provide a **comprehensive security assessment summary** in the following format:
 
 ### 2. Vulnerability Analysis
 
-For each vulnerability (FN):
+For each vulnerability (FP / false allow):
 
 - **Severity**: Critical/High/Medium/Low
 - **Attack Type**: IDOR, BOLA, Auth Bypass, etc.
 - **Risk**: What could an attacker do?
 - **Remediation**: Specific fix required
 
-### 3. False Positives Review
+### 3. False Denials Review
 
-For each FP (if any):
+For each FN (if any):
 
 - **Endpoint**: Which endpoint?
 - **Issue**: Why is it incorrectly denied?

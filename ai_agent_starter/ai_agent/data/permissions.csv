@@ -1,7 +1,57 @@
-permission_id,permission_code,permission_group,permission_desc
-1,update_data_personal,Data Management,Permission to update personal data
-2,request_history_and_status,Request Management,Permission to request history and status
-3,manage_consent,Consent Management,Permission to manage consent
-4,attachment,Request Management,Permission to attach document for update personal data
-5,export_pdf,Data Management,Permission to export personal data
-6,rbac_admin,user_management,Allows full access to manage roles permissions and user access
+permission_id,permission_code,permission_group,permission_desc,critical
+1,admin_audit_logs_list,Admin,GET /api/admin/audit-logs/ - List recent audit logs,False
+2,admin_audit_logs_by_user,Admin,GET /api/admin/audit-logs/{user_id}/ - List audit logs for one actor,True
+3,admin_dashboard_retrieve,Admin,GET /api/admin/dashboard/ - Get admin dashboard counts,False
+4,admin_users_create,Admin,POST /api/admin/users/ - Create a user as admin,False
+5,attendance_list,Attendance,GET /api/attendance/ - List attendance records,False
+6,attendance_create,Attendance,POST /api/attendance/ - Create an attendance record,False
+7,attendance_clock_in,Attendance,POST /api/attendance/clock-in/ - Clock in for today,False
+8,attendance_clock_out,Attendance,POST /api/attendance/clock-out/ - Clock out for today,False
+9,attendance_get,Attendance,GET /api/attendance/{attendance_id}/ - Get an attendance record,True
+10,attendance_update,Attendance,PUT /api/attendance/{attendance_id}/ - Update an attendance record,True
+11,auth_login_create,Authentication,POST /api/auth/login/ - Login and obtain JWT tokens,False
+12,auth_logout_create,Authentication,POST /api/auth/logout/ - Logout current session,False
+13,auth_me_retrieve,Authentication,GET /api/auth/me/ - Get the authenticated user profile,False
+14,benefit_plans_list,Benefits,GET /api/benefits/ - List active benefit plans,False
+15,benefit_plans_create,Benefits,POST /api/benefits/ - Create a benefit plan,False
+16,benefit_enrollments_list,Benefits,GET /api/benefits/enrollments/ - List benefit enrollments,False
+17,benefit_enrollments_create,Benefits,POST /api/benefits/enrollments/ - Enroll in a benefit plan,False
+18,benefit_plan_get,Benefits,GET /api/benefits/{benefit_id}/ - Get a benefit plan,True
+19,benefit_plan_update,Benefits,PUT /api/benefits/{benefit_id}/ - Update a benefit plan,True
+20,documents_list,Documents,GET /api/documents/ - List documents owned by the current user,False
+21,documents_create,Documents,POST /api/documents/ - Create a document,False
+22,documents_destroy,Documents,DELETE /api/documents/{id}/ - Delete a document,True
+23,documents_retrieve,Documents,GET /api/documents/{id}/ - Get a document,True
+24,documents_partial_update,Documents,PATCH /api/documents/{id}/ - Partially update a document,True
+25,documents_update,Documents,PUT /api/documents/{id}/ - Replace a document,True
+26,documents_download_retrieve,Documents,GET /api/documents/{id}/download/ - Get document download metadata,True
+27,expenses_list,Expenses,GET /api/expenses/ - List expense claims,False
+28,expenses_create,Expenses,POST /api/expenses/ - Submit an expense claim,False
+29,expense_summary,Expenses,GET /api/expenses/summary/ - Get expense summary,False
+30,expense_delete,Expenses,DELETE /api/expenses/{expense_id}/ - Delete an expense claim,True
+31,expense_get,Expenses,GET /api/expenses/{expense_id}/ - Get an expense claim,True
+32,expense_update,Expenses,PUT /api/expenses/{expense_id}/ - Update an expense claim,True
+33,leaves_list,Leaves,GET /api/leaves/ - List leave requests owned by the current user,False
+34,leaves_create,Leaves,POST /api/leaves/ - Create a leave request,False
+35,leaves_destroy,Leaves,DELETE /api/leaves/{id}/ - Delete a leave request,True
+36,leaves_retrieve,Leaves,GET /api/leaves/{id}/ - Get a leave request,True
+37,leaves_partial_update,Leaves,PATCH /api/leaves/{id}/ - Partially update a leave request,True
+38,leaves_update,Leaves,PUT /api/leaves/{id}/ - Replace a leave request,True
+39,leaves_approve_update,Leaves,PUT /api/leaves/{id}/approve/ - Approve or reject a leave request,True
+40,leaves_cancel_update,Leaves,PUT /api/leaves/{id}/cancel/ - Cancel a leave request,True
+41,payroll_list,Payroll,GET /api/payroll/ - List payroll records,False
+42,payroll_create,Payroll,POST /api/payroll/ - Create a payroll record,False
+43,payroll_retrieve,Payroll,GET /api/payroll/{user_id}/ - List payroll records for a user,True
+44,payroll_update,Payroll,PUT /api/payroll/{user_id}/ - Create or update payroll for a user,True
+45,performance_reviews_list,Performance Reviews,GET /api/performance-reviews/ - List performance reviews,False
+46,performance_reviews_create,Performance Reviews,POST /api/performance-reviews/ - Create a performance review,False
+47,performance_review_summary,Performance Reviews,GET /api/performance-reviews/summary/ - Get performance review summary,False
+48,performance_review_get,Performance Reviews,GET /api/performance-reviews/{review_id}/ - Get a performance review,True
+49,performance_review_update,Performance Reviews,PUT /api/performance-reviews/{review_id}/ - Update a performance review,True
+50,users_list,Users,GET /api/users/ - List users,False
+51,users_create,Users,POST /api/users/ - Create a user via the collection route,False
+52,users_destroy,Users,DELETE /api/users/{id}/ - Delete a user,True
+53,users_retrieve,Users,GET /api/users/{id}/ - Get a user profile,True
+54,users_partial_update,Users,PATCH /api/users/{id}/ - Partially update a user profile,True
+55,users_update,Users,PUT /api/users/{id}/ - Replace a user profile,True
+56,users_role_update,Users,PUT /api/users/{id}/role/ - Update a user role,True

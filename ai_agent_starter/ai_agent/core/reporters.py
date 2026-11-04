@@ -1,432 +1,330 @@
-import os, json, datetime, time, re, csv
-from typing import List, Dict, Any
+"""Generic report serialization for API access-control assessments."""
+
+import datetime
+import json
+import os
+import time
+from typing import Any, Dict, List
+
+from .evaluators import (
+    classify,
+    confusion_counts,
+    coverage,
+    effective_account_alias,
+    effective_policy_role,
+    expected_status,
+    metrics,
+    time_to_detect,
+)
 from .memory import Result, TestCase
-from .evaluators import confusion_counts, metrics, coverage, time_to_detect, expected_status, classify, roles_allowed_for_endpoint
 
 
-def _parse_id_from_artifact(artifact_path: str, path_template: str) -> str:
-    """Extract resolved ID from artifact path (e.g. users_22 -> 22, payroll_4 -> 4, leaves_111 -> 111)."""
-    if not artifact_path:
-        return ""
-    path_norm = (artifact_path or "").replace("\\", "/")
-    # segments like users_22, payroll_4, leaves_111, admin_audit-logs_4
-    m = re.search(r"[/_](\d+)(?:_|\.|-|/|$)", path_norm)
-    return m.group(1) if m else ""
+_SENSITIVE_FIELDS = (
+    "password", "passwd", "secret", "token", "authorization", "api_key",
+    "apikey", "private_key", "client_secret", "session_id", "cookie",
+)
 
 
-def _scenario_description(role: str, path: str, method: str, self_access: bool, label: str, orig_id: str, mod_id: str) -> str:
-    """Human-readable scenario description for submission."""
-    role_lower = (role or "").strip().lower().replace("_", " ")
-    p = (path or "").lower()
-    if "user" in p and "role" not in p:
-        resource = "user profile"
-    elif "payroll" in p:
-        resource = "payroll record"
-    elif "leave" in p:
-        resource = "leave request"
-    elif "document" in p:
-        resource = "document"
-    elif "auth/me" in p:
-        resource = "session/identity"
-    elif "admin" in p or "audit" in p:
-        resource = "admin/audit data"
-    else:
-        resource = "resource"
-    if label == "FN" and not self_access:
-        return f"{role_lower} attempts to access another user's {resource}"
-    if label == "FN" and self_access:
-        return f"{role_lower} accessed {resource} (expected deny)"
-    if label == "TP" and self_access:
-        return f"{role_lower} accesses own {resource} (baseline)"
-    if label == "TP" and not self_access:
-        return f"{role_lower} accesses other {resource} (allowed)"
-    if label == "TN":
-        return f"{role_lower} correctly denied access to {resource}"
-    if label == "FP":
-        return f"{role_lower} incorrectly denied access to {resource}"
-    return f"{role_lower} {method} {path} (self={self_access}) -> {label}"
+def _redact_sensitive(value: Any) -> Any:
+    """Redact common credentials before writing response bodies into reports."""
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if any(marker in str(key).lower() for marker in _SENSITIVE_FIELDS)
+            else _redact_sensitive(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
 
 
-def _write_submission_csvs(report_path: str, endpoints: list, roles: list, artifacts: list, classified: dict, results: List[Result], policy) -> None:
-    """Write critical_endpoints.csv and test_scenarios.csv to ai_agent/data/ for submission."""
+def _llm_expectation_hypothesis(mutation: Any) -> Dict[str, Any] | None:
+    """Normalize advisory model output while keeping it separate from policy verdicts."""
+    if not isinstance(mutation, dict):
+        return None
+    value = mutation.get("expectation_hypothesis")
+    if not isinstance(value, dict):
+        return None
+    access = str(value.get("access", "unknown")).strip().lower()
+    if access not in {"allow", "deny", "unknown"}:
+        access = "unknown"
     try:
-        base = os.path.dirname(os.path.dirname(report_path))
-        data_dir = os.path.join(base, "data")
-        os.makedirs(data_dir, exist_ok=True)
-    except Exception:
-        return
-    seen = set()
-    ep_list = []
-    for a in artifacts:
-        m, p = (a.get("method") or "GET").upper(), (a.get("path") or "").strip()
-        if not p or (m, p) in seen:
-            continue
-        seen.add((m, p))
-        ep_list.append({"method": m, "path": p})
-    path_to_id = {(e["method"], e["path"]): f"EP{i:03d}" for i, e in enumerate(ep_list, 1)}
-    def _mod(p): return _path_to_module(p)
-    def _res(p): return _path_to_resource_type(p)
-    def _has_id(p): return "yes" if re.search(r"\{[^}]+\}", p or "") else "no"
-    def _id_name(p): m = re.search(r"\{([^}]+)\}", p or ""); return m.group(1) if m else ""
-    def _reason(p, m): return _critical_reason(p, m)
-
-    with open(os.path.join(data_dir, "critical_endpoints.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["endpoint_id", "path", "http_method", "module", "resource_type", "contains_identifier", "identifier_name", "critical_reason", "allowed_roles", "test_priority"])
-        for i, e in enumerate(ep_list, 1):
-            p, m = e["path"], e["method"]
-            roles_str = ",".join(roles_allowed_for_endpoint(policy, m, p))
-            w.writerow([f"EP{i:03d}", p, m, _mod(p), _res(p), _has_id(p), _id_name(p), _reason(p, m), roles_str, "high" if _has_id(p) == "yes" or "admin" in p.lower() else "medium"])
-
-    # Build test_scenarios from results so we have artifact path for original/modified identifier
-    rows = []
-    for idx, r in enumerate(results):
-        try:
-            exp = expected_status(policy, r.tc)
-            label = classify(exp, r.status_code)
-            if label == "TP_ALLOW":
-                label = "TP"
-            elif label == "NOT_FOUND":
-                label = "NF"
-            elif label == "ERROR":
-                label = "ERR"
-            elif label == "SKIP":
-                continue
-        except Exception:
-            continue
-        m = (r.tc.method or "GET").upper()
-        p = (r.tc.path or "").strip()
-        role = (r.tc.role or "").strip()
-        sa = r.tc.self_access
-        ep_id = path_to_id.get((m, p), "")
-        has_placeholder = bool(re.search(r"\{[^}]+\}", p))
-        if not sa and has_placeholder:
-            vuln = "IDOR"
-            action = "replace_identifier"
-        elif label == "FN":
-            vuln = "BOLA"
-            action = "unauthorized_read" if m == "GET" else "unauthorized_write"
-        elif label == "TP" and sa:
-            vuln = "BASELINE"
-            action = "self_access"
-        else:
-            vuln = "BOLA" if label == "TN" else "BOLA"
-            action = "replace_identifier" if not sa else "self_access"
-        exp_result = "allow" if label == "TP" else "deny"
-        artifact_path = getattr(r, "artifact", None) or ""
-        resolved_id = _parse_id_from_artifact(artifact_path, p)
-        if sa:
-            orig_id, mod_id = resolved_id, ""
-        else:
-            orig_id, mod_id = "", resolved_id
-        resource_owner = role if sa else "other"
-        desc = _scenario_description(role, p, m, sa, label, orig_id, mod_id)
-        rows.append([f"SC{len(rows)+1:03d}", ep_id, vuln, role, resource_owner, action, orig_id, mod_id, exp_result, desc])
-    with open(os.path.join(data_dir, "test_scenarios.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["scenario_id", "endpoint_id", "vulnerability_type", "actor_role", "resource_owner_role", "test_action", "original_identifier", "modified_identifier", "expected_result", "scenario_description"])
-        for row in rows:
-            w.writerow(row)
-    return
+        confidence = float(value.get("confidence"))
+        confidence = min(1.0, max(0.0, confidence))
+    except (TypeError, ValueError):
+        confidence = None
+    evidence = value.get("evidence", [])
+    if not isinstance(evidence, list):
+        evidence = [str(evidence)] if evidence else []
+    return {
+        "access": access,
+        "confidence": confidence,
+        "rationale": str(value.get("rationale", ""))[:1000],
+        "evidence": [str(item)[:300] for item in evidence[:8]],
+        "source": "llm",
+        "used_for_verdict": False,
+    }
 
 
-def _path_to_module(path: str) -> str:
-    p = (path or "").strip().strip("/").split("/")
-    if not p or not p[0]: return "root"
-    if p[0].startswith("auth"): return "auth"
-    if p[0].startswith("admin"): return "admin"
-    return p[0] or "root"
-
-
-def _path_to_resource_type(path: str) -> str:
-    p = (path or "").lower()
-    if "user" in p and "role" in p: return "user_role"
-    if "user" in p: return "user_profile"
-    if "payroll" in p: return "payroll_record"
-    if "leave" in p: return "leave_workflow" if "approve" in p or "cancel" in p else "leave_request"
-    if "document" in p: return "document_download" if "download" in p else "document"
-    if "audit" in p: return "audit_log"
-    if "dashboard" in p: return "dashboard"
-    if "auth" in p: return "authentication"
-    return "resource"
-
-
-def _critical_reason(path: str, method: str) -> str:
-    p, m = (path or "").lower(), (method or "").upper()
-    r = []
-    if re.search(r"\{[^}]+\}", path or ""): r.append("contains object identifier")
-    if "payroll" in p: r.append("financial data")
-    if "user" in p: r.append("PII/identity")
-    if "admin" in p or "audit" in p: r.append("admin/audit scope")
-    if "auth/me" in p: r.append("session disclosure")
-    return "; ".join(r) if r else "tested endpoint"
-
-def _build_offline_summary(
-    cf: Dict[str, int],
-    m: Dict[str, float],
-    cov: Dict[str, Any],
-    classified: Dict[str, list],
-    total_tests: int,
-    pot_vulns: int,
+def _fallback_summary(
+    counts: Dict[str, int], metric_values: Dict[str, float],
+    coverage_data: Dict[str, Any], classified: Dict[str, list], total: int,
 ) -> str:
-    """Build deterministic markdown summary when LLM is unavailable."""
-    fp = int(cf.get("FP", 0))
-    fn = int(cf.get("FN", 0))
-    err = int(cf.get("ERR", 0))
-    nf = int(cf.get("NF", 0))
-    skip = int(cf.get("SKIP", 0))
-    evaluated = int(m.get("evaluated_cases", max(1, total_tests)))
-    fp_rate = (fp / max(1, evaluated)) * 100.0
-    cov_pct = cov.get("coverage_pct", 0)
-
-    if fn > 0:
-        posture = "❌ **Poor**"
-        immediate = "🚨 **YES**"
-    elif fp > 0 or err > 0:
-        posture = "⚠️ **Needs Improvement**"
-        immediate = "⚠️ **Recommended**"
+    """Build neutral fallback text; unknown policy is never described as secure."""
+    fp = counts.get("FP", 0)
+    fn = counts.get("FN", 0)
+    errors = counts.get("ERR", 0)
+    unverified = counts.get("UNVERIFIED", 0)
+    if not metric_values.get("evaluated_cases", 0):
+        assessment = "Incomplete: no cases could be evaluated against explicit access expectations."
+    elif fp:
+        assessment = "Review required: access was allowed where the configured policy expected denial."
+    elif unverified:
+        assessment = "Incomplete: some operations have no matching access expectation."
+    elif counts.get("INCONCLUSIVE", 0):
+        assessment = "Incomplete: some requests were rejected by validation or resource state checks."
+    elif fn or errors:
+        assessment = "Review required: unexpected denials or server errors were observed."
     else:
-        posture = "✅ **Good**"
-        immediate = "✅ **No**"
+        assessment = "No policy violations were classified in evaluated cases."
 
-    high_vuln = classified.get("FN", [])[:3]
-    high_fp = classified.get("FP", [])[:3]
-
-    lines = []
-    lines.append("# 🛡️ Security Assessment Summary: Broken Access Control (BAC) Report")
-    lines.append("")
-    lines.append("## 1. Executive Summary")
-    lines.append(f"**Overall Security Posture:** {posture}  ")
-    lines.append(
-        f"Test execution completed with **{total_tests}** total outcomes and **{pot_vulns}** potential BAC vulnerabilities "
-        f"(False Negatives). Coverage is **{cov_pct}%**."
+    lines = [
+        "# Security Assessment Summary", "", assessment, "",
+        "Results compare observed responses with configured expectations. "
+        "Missing expectations are unverified and are not treated as findings.", "",
+        f"- Outcomes: {total}",
+        f"- Unexpected allowed outcomes (FP): {fp}",
+        f"- Unexpected denied outcomes (FN): {fn}",
+        f"- Server errors: {errors}",
+        f"- Not found / inconclusive: {counts.get('NF', 0)}",
+        f"- Skipped: {counts.get('SKIP', 0)}",
+        f"- Request rejected / inconclusive: {counts.get('INCONCLUSIVE', 0)}",
+        f"- Unverified (no matching policy): {unverified}",
+        f"- Operation coverage: {coverage_data.get('coverage_pct', 0)}% "
+        f"({coverage_data.get('tested_pairs', 0)}/{coverage_data.get('total_pairs', 0)} role-operation pairs)",
+        "", "## Cases for review", "",
+    ]
+    review_items = (
+        classified.get("FP", []) + classified.get("FN", [])
+        + classified.get("INCONCLUSIVE", [])
+        + classified.get("UNVERIFIED", [])
     )
-    lines.append("")
-    lines.append(f"**Immediate Action Required:** {immediate}")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("## 2. Vulnerability Analysis (False Negatives)")
-    if high_vuln:
-        for i, v in enumerate(high_vuln, start=1):
-            lines.append(f"### 🚨 Vulnerability {i}")
-            lines.append(f"*   **Endpoint:** `{v.get('method')} {v.get('path')}`")
-            lines.append(f"*   **Role:** {v.get('role')}")
-            lines.append("*   **Severity:** **High**")
-            lines.append("*   **Risk:** Endpoint expected to be denied but returned allowed behavior.")
-            lines.append("*   **Remediation:** Tighten RBAC policy/middleware and validate role checks on this handler.")
-            lines.append("")
+    if not review_items:
+        lines.append("No cases require review based on available expectations.")
     else:
-        lines.append("No false negatives detected in this run.")
-        lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("## 3. False Positives Review")
-    lines.append(f"*   **Count:** {fp}")
-    lines.append(f"*   **Estimated FP Rate:** {fp_rate:.1f}%")
-    if high_fp:
-        lines.append("*   **Examples:**")
-        for it in high_fp:
-            lines.append(f"    * `{it.get('method')} {it.get('path')}` [{it.get('role')}] -> {it.get('status')}")
-    lines.append("*   **Fix:** Review endpoint allow-list/policy mapping and token role propagation.")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("## 4. Performance Assessment")
-    lines.append(f"*   **Coverage:** {cov_pct}% ({cov.get('covered_pairs', 0)}/{cov.get('total_pairs', 0)} role×endpoint pairs)")
-    lines.append(f"*   **System Errors (5xx):** {err}")
-    lines.append(f"*   **Not Found (404):** {nf}")
-    lines.append(f"*   **Skipped/Inconclusive:** {skip}")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("## 5. Recommendations (Prioritized)")
-    lines.append("### **HIGH PRIORITY:**")
-    lines.append("- [ ] Patch endpoints listed under FN to enforce deny decisions correctly.")
-    lines.append("- [ ] Investigate and fix server-side 5xx paths first (stability + security).")
-    lines.append("### **MEDIUM PRIORITY:**")
-    lines.append("- [ ] Reduce FP by validating policy matrix and auth middleware mapping.")
-    lines.append("- [ ] Normalize 401 vs 403 responses to reduce ambiguity.")
-    lines.append("### **LOW PRIORITY:**")
-    lines.append("- [ ] Reduce SKIP by improving dynamic ID discovery and fixture seeding.")
-    lines.append("- [ ] Archive artifacts and keep regression comparisons per run.")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("## 6. Security Best Practices Compliance")
-    lines.append(f"*   **OWASP A01:2021 (Broken Access Control):** {'❌ FAIL' if fn > 0 else '✅ PASS'}")
-    lines.append(f"*   **Principle of Least Privilege:** {'❌ FAIL' if fn > 0 else '⚠️ PARTIAL' if fp > 0 else '✅ PASS'}")
-    lines.append(f"*   **Fail Secure:** {'✅ PASS' if fp > 0 else '⚠️ PARTIAL'}")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("## 7. Next Steps")
-    lines.append("1. Re-test FN endpoints after policy/controller fixes.")
-    lines.append("2. Add endpoint-specific fixtures to reduce unresolved placeholders.")
-    lines.append("3. Keep this test suite in CI to prevent BAC regressions.")
-    lines.append("")
-    lines.append("> Note: This summary is generated by deterministic offline fallback because LLM output was unavailable.")
+        for item in review_items[:50]:
+            hypothesis = item.get("ai_expectation_hypothesis") or {}
+            hypothesis_text = (
+                f"; AI hypothesis={hypothesis.get('access')} "
+                f"(confidence={hypothesis.get('confidence')})"
+                if hypothesis else ""
+            )
+            lines.append(
+                f"- {item.get('method')} {item.get('resolved_path') or item.get('path')} "
+                f"[account={item.get('account_label') or item.get('account')}; role={item.get('role')}] "
+                f"status={item.get('status')}; expectation={item.get('expected_access', 'unknown')} "
+                f"(source={item.get('expectation_source', 'unknown')}){hypothesis_text}"
+            )
+    lines.extend([
+        "", "## Metrics", "",
+        f"- Accuracy: {metric_values.get('accuracy', 0)}",
+        f"- Precision: {metric_values.get('precision', 0)}",
+        f"- Recall: {metric_values.get('recall', 0)}",
+        f"- F1 score: {metric_values.get('f1', 0)}", "",
+        "Review each candidate against API documentation and policy before confirming an issue.",
+    ])
     return "\n".join(lines)
 
-def save_json_report(path: str, results: List[Result], policy, tests: List[TestCase], roles: list, endpoints: list, start_ts: float = 0.0, reflection: Dict[str, Any] = None, llm_summary: str = None):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    
-    # Calculate total execution duration
-    end_ts = time.time()
-    total_duration = round(end_ts - start_ts, 3) if start_ts > 0 else None
-    
-    cf = confusion_counts(results, policy)
-    m = metrics(cf)
-    cov = coverage(tests, roles, endpoints)
-    ttd = time_to_detect(results, policy, start_ts)
-    # Summaries
-    total_tests = len(results)
-    # Potential vulns per our conservative definition: expected deny but got 200 (classified as FN)
-    pot_vulns = int(cf.get("FN", 0))
-    # Collect artifacts mapping
-    artifacts = []
-    for r in results:
-        artifacts.append({
-            "method": r.tc.method,
-            "path": r.tc.path,
-            "role": r.tc.role,
-            "artifact": r.artifact,
-        })
 
-    # Classify each result into TP/TN/FP/FN/NF/ERR lists
-    classified: Dict[str, list] = {"TP": [], "TN": [], "FP": [], "FN": [], "NF": [], "ERR": [], "SKIP": []}
-    for r in results:
-        try:
-            exp = expected_status(policy, r.tc)
-            lab = classify(exp, r.status_code)
-            # Normalize labels to keys above
-            if lab == "TP_ALLOW":
-                key = "TP"
-            elif lab == "NOT_FOUND":
-                key = "NF"
-            elif lab == "ERROR":
-                key = "ERR"
-            elif lab == "SKIP":
-                key = "SKIP"
-            else:
-                key = lab
-            if key in classified:
-                classified[key].append({
-                    "method": r.tc.method,
-                    "path": r.tc.path,
-                    "role": r.tc.role,
-                    "self_access": r.tc.self_access,
-                    "status": r.status_code,
-                })
-        except Exception:
-            continue
-    # Use DD-MM-YYYY HH:MM format (UTC-based to preserve prior semantics)
+def save_json_report(
+    path: str,
+    results: List[Result],
+    policy,
+    tests: List[TestCase],
+    roles: list,
+    endpoints: list,
+    start_ts: float = 0.0,
+    reflection: Dict[str, Any] = None,
+    llm_summary: str = None,
+    run_metadata: Dict[str, Any] = None,
+):
+    """Write JSON and Markdown reports beside the run, without touching input data."""
+    output_dir = os.path.dirname(os.path.abspath(path))
+    os.makedirs(output_dir, exist_ok=True)
+    total_duration = round(time.time() - start_ts, 3) if start_ts > 0 else None
+
+    counts = confusion_counts(results, policy)
+    metric_values = metrics(counts)
+    coverage_data = coverage(tests, roles, endpoints)
+    detection = time_to_detect(results, policy, start_ts)
+    classified: Dict[str, list] = {
+        key: [] for key in ("TP", "TN", "FP", "FN", "NF", "ERR", "SKIP", "INCONCLUSIVE", "UNVERIFIED")
+    }
+
+    serialized_results = []
+    artifacts = []
+    for result in results:
+        tc = result.tc
+        expectation = expected_status(policy, tc)
+        label = classify(expectation, result.status_code)
+        key = {"TP_ALLOW": "TP", "NOT_FOUND": "NF", "ERROR": "ERR"}.get(label, label)
+        row = {
+            "method": tc.method,
+            "path": tc.path,
+            "account": effective_account_alias(tc),
+            "account_label": (run_metadata or {}).get('account_labels', {}).get(effective_account_alias(tc), effective_account_alias(tc)),
+            "resolved_path": result.resolved_path,
+            "target_account": result.target_account,
+            "attempts": _redact_sensitive(result.attempts),
+            "recovery": _redact_sensitive(result.recovery),
+            "role": effective_policy_role(policy, tc),
+            "actor_account": effective_account_alias(tc),
+            "actor_role": effective_policy_role(policy, tc),
+            "self_access": tc.self_access,
+            "status": result.status_code,
+            "classification": label,
+            "expected_access": expectation.get("expected_access", "unknown"),
+            "expectation_source": expectation.get("expectation_source", "unknown"),
+            "ai_expectation_hypothesis": _llm_expectation_hypothesis(tc.mutation),
+            "mutation": _redact_sensitive(tc.mutation),
+            "body": _redact_sensitive(result.body),
+            "timestamp": result.ts,
+            "artifact": result.artifact,
+        }
+        serialized_results.append(row)
+        artifacts.append({
+            "method": tc.method, "path": tc.path,
+            "role": effective_policy_role(policy, tc), "artifact": result.artifact,
+        })
+        if key in classified:
+            classified[key].append(row)
+
+    endpoint_inventory = [
+        {"method": str(endpoint.get("method", "GET")).upper(), "path": str(endpoint.get("path", ""))}
+        for endpoint in (endpoints or [])
+        if isinstance(endpoint, dict) and endpoint.get("path")
+    ]
+    planned_cases = [
+        {
+            "method": tc.method, "path": tc.path,
+            "account": effective_account_alias(tc),
+            "role": effective_policy_role(policy, tc),
+            "self_access": tc.self_access, "depth": tc.depth,
+            "mutation": _redact_sensitive(tc.mutation),
+        }
+        for tc in (tests or [])
+    ]
     llm_text = (llm_summary or "").strip()
-    llm_unavailable = (not llm_text) or llm_text.startswith("⚠️")
-    effective_summary = llm_text if not llm_unavailable else _build_offline_summary(cf, m, cov, classified, total_tests, pot_vulns)
+    llm_unavailable = not llm_text or llm_text.startswith("⚠️")
+    summary = _fallback_summary(counts, metric_values, coverage_data, classified, len(results)) if llm_unavailable else llm_text
     data = {
-        "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%d-%m-%Y %H:%M"),
-        "confusion": cf,
-        "metrics": m,
-        "coverage": cov,
-        "time_to_detect": ttd,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "run_metadata": run_metadata or {},
+        "label_schema": {
+            "version": "3.1",
+            "positive_class": "ALLOW",
+            "TP": "expected ALLOW, observed 2xx",
+            "FN": "expected ALLOW, observed deny",
+            "TN": "expected DENY, observed 401/403",
+            "FP": "expected DENY, observed 2xx",
+            "UNVERIFIED": "no explicit access expectation matched this case",
+            "INCONCLUSIVE": "request sent but validation or resource state prevents an authorization verdict",
+        },
+        "confusion": counts,
+        "metrics": metric_values,
+        "coverage": coverage_data,
+        "endpoint_inventory": endpoint_inventory,
+        "planned_cases": planned_cases,
+        "time_to_detect": detection,
         "total_duration_seconds": total_duration,
         "summary": {
-            "total_tests": total_tests,
-            "potential_vulnerabilities": pot_vulns,
+            "generated_cases": len(tests or []),
+            "result_records": len(results),
+            "evaluated_cases": int(metric_values.get("evaluated_cases", 0)),
+            "potential_vulnerabilities": int(counts.get("FP", 0)),
+            "unverified_cases": int(counts.get("UNVERIFIED", 0)),
         },
-        "llm_summary": effective_summary,
+        "llm_summary": summary,
         "llm_summary_raw": llm_text,
-        "llm_summary_fallback": bool(llm_unavailable),
+        "llm_summary_fallback": llm_unavailable,
         "artifacts": artifacts,
         "reflection": reflection or {},
         "classified": classified,
-        "results": [{
-            "method": r.tc.method, "path": r.tc.path, "role": r.tc.role,
-            "self_access": r.tc.self_access, "status": r.status_code, "body": r.body, "ts": r.ts,
-            "artifact": r.artifact
-        } for r in results]
+        "results": serialized_results,
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    try:
-        _write_submission_csvs(path, endpoints, roles, artifacts, classified, results, policy)
-    except Exception:
-        pass
-    # Also write a comprehensive Markdown report with LLM summary
-    md_path = path.replace('.json', '.md')
-    try:
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(f"# 🔒 BAC Security Test Report\n\n")
-            f.write(f"**Generated:** {data['generated_at']}\n\n")
-            f.write("---\n\n")
-            
-            # AI summary (LLM or deterministic fallback)
-            f.write(f"## 🤖 AI Security Assessment\n\n")
-            f.write(effective_summary)
-            f.write("\n\n---\n\n")
-            
-            f.write(f"## 📊 Test Execution Summary\n\n")
-            f.write(f"- **Total Tests:** {total_tests}\n")
-            f.write(f"- **Potential Vulnerabilities (FN):** {pot_vulns} 🚨\n")
-            f.write(f"- **Coverage:** {cov['coverage_pct']}% of {cov['total_pairs']} role×endpoint pairs\n")
-            f.write(f"- **Total Execution Time:** {total_duration} seconds ⏱️\n")
-            f.write(f"- **Time to First Detection:** {ttd.get('seconds')} seconds\n\n")
-            
-            f.write("## 🎯 Performance Metrics\n\n")
-            f.write(f"- **Accuracy:** {round(m.get('accuracy', 0) * 100, 1)}%\n")
-            f.write(f"- **Precision:** {round(m.get('precision', 0) * 100, 1)}%\n")
-            f.write(f"- **Recall:** {round(m.get('recall', 0) * 100, 1)}%\n")
-            f.write(f"- **F1 Score:** {round(m.get('f1', 0) * 100, 1)}%\n\n")
-            
-            f.write("## 📋 Confusion Matrix\n\n")
-            f.write(f"- ✅ **TP (True Positives):** {cf['TP']} - Allowed endpoints working correctly\n")
-            f.write(f"- ✅ **TN (True Negatives):** {cf['TN']} - Unauthorized access correctly blocked\n")
-            f.write(f"- ⚠️ **FP (False Positives):** {cf['FP']} - Allowed endpoints incorrectly denied\n")
-            f.write(f"- 🚨 **FN (False Negatives):** {cf['FN']} - **VULNERABILITIES DETECTED**\n")
-            if cf.get('ERR', 0) > 0:
-                f.write(f"- ❌ **ERR (System Errors):** {cf['ERR']} - 5xx responses\n")
-            if cf.get('NF', 0) > 0:
-                f.write(f"- ℹ️ **NF (Not Found):** {cf['NF']} - 404 responses (not BAC findings per OWASP)\n")
-            if cf.get('SKIP', 0) > 0:
-                f.write(f"- ⏭️ **SKIP (Inconclusive):** {cf['SKIP']} - Invalid/incomplete test outcomes excluded from core confusion labels\n")
-            f.write("\n")
-            
-            # Endpoint lists by classification
-            def _writelst(title: str, items: list, emoji: str = ""):
-                f.write(f"### {emoji} {title} ({len(items)})\n\n")
-                cap = 200
-                for it in items[:cap]:
-                    try:
-                        sa = it.get('self_access')
-                        so = 'self' if sa is True else ('other' if sa is False else '')
-                    except Exception:
-                        so = ''
-                    suffix = f" {so}" if so else ''
-                    f.write(f"- `{it['method']} {it['path']}` [{it['role']}{suffix}] → {it['status']}\n")
-                if len(items) > cap:
-                    f.write(f"\n... and {len(items)-cap} more\n\n")
-                else:
-                    f.write("\n")
+    with open(path, "w", encoding="utf-8") as report_file:
+        json.dump(data, report_file, indent=2, ensure_ascii=False)
 
-            f.write("## 🧭 Endpoints by Classification\n\n")
-            _writelst("TP (Allowed as expected)", classified.get('TP', []), "✅")
-            _writelst("TN (Denied as expected)", classified.get('TN', []), "✅")
-            _writelst("FP (Allowed expected but denied)", classified.get('FP', []), "⚠️")
-            _writelst("FN (Denied expected but allowed) — Vulnerabilities", classified.get('FN', []), "🚨")
-            if cf.get('NF', 0) > 0:
-                _writelst("NF (Not Found)", classified.get('NF', []), "ℹ️")
-            if cf.get('ERR', 0) > 0:
-                _writelst("ERR (5xx System Errors)", classified.get('ERR', []), "❌")
-            if cf.get('SKIP', 0) > 0:
-                _writelst("SKIP (Inconclusive outcomes)", classified.get('SKIP', []), "⏭️")
-
-            f.write("## 📁 Test Artifacts\n\n")
-            f.write("Full request/response artifacts saved for forensic analysis:\n\n")
-            for a in artifacts[:50]:
-                f.write(f"- `{a['method']} {a['path']}` [{a['role']}] → {a['artifact']}\n")
-            if len(artifacts) > 50:
-                f.write(f"\n... and {len(artifacts)-50} more artifacts\n")
-    except Exception:
-        pass
+    markdown_path = os.path.splitext(path)[0] + ".md"
+    with open(markdown_path, "w", encoding="utf-8") as report_file:
+        report_file.write(render_markdown_report(data))
     return path
+
+
+def _markdown_cell(text: Any) -> str:
+    """Make a value safe for a single markdown table cell."""
+    return str(text).replace("\n", " ").replace("\r", " ").replace("|", "\\|").strip()
+
+
+def render_markdown_report(data: Dict[str, Any]) -> str:
+    """Render the human-readable markdown report from a serialized report `data`
+    dict (the same structure written to the JSON file). Results are shown as
+    scannable tables grouped by classification, findings first."""
+    summary = data.get("llm_summary") or ""
+    endpoint_inventory = data.get("endpoint_inventory", []) or []
+    classified = data.get("classified", {}) or {}
+
+    lines = [f"# Security Assessment Report", "", f"Generated: {data.get('generated_at', '')}", "", summary, ""]
+
+    lines.append(f"## Operation inventory ({len(endpoint_inventory)})")
+    lines.append("")
+    lines.append("| Method | Path |")
+    lines.append("| --- | --- |")
+    for endpoint in endpoint_inventory:
+        lines.append(f"| {endpoint.get('method', '')} | `{_markdown_cell(endpoint.get('path', ''))}` |")
+
+    label_titles = {
+        "FP": "FP — allowed, but policy expected deny (review required)",
+        "FN": "FN — denied, but policy expected allow",
+        "INCONCLUSIVE": "INCONCLUSIVE — rejected by validation or resource state",
+        "UNVERIFIED": "UNVERIFIED — no matching policy expectation",
+        "NF": "NF — not found; authorization unverified",
+        "ERR": "ERR — fixture/setup error; not evaluated",
+        "SKIP": "SKIP — skipped",
+        "TN": "TN — denied as expected",
+        "TP": "TP — allowed as expected",
+    }
+    label_order = ["FP", "FN", "INCONCLUSIVE", "UNVERIFIED", "NF", "ERR", "SKIP", "TN", "TP"]
+
+    lines.extend(["", "## Results", ""])
+    for label in label_order:
+        items = classified.get(label) or []
+        if not items:
+            continue
+        lines.append(f"### {label_titles.get(label, label)} ({len(items)})")
+        lines.append("")
+        lines.append("| Method | Path | Account | Role | Scope | Status | Expected | Source | Notes |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        for item in items[:200]:
+            notes = []
+            if item.get('resolved_path') and item['resolved_path'] != item.get('path'):
+                notes.append(f"template `{item.get('path')}`")
+            if item.get('status') in (0, 400, 404, 409, 422):
+                body = item.get('body') or {}
+                reason = json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body)
+                notes.append("reason: " + reason.replace("\n", " ")[:200])
+            attempts = [attempt for attempt in (item.get('attempts') or []) if attempt.get('path')]
+            if len(attempts) > 1:
+                notes.append("steps: " + ", ".join(f"{attempt['path']}→{attempt['status']}" for attempt in attempts[:4]))
+            for decision in (item.get('recovery') or []):
+                notes.append(f"recovery: {decision.get('action')}")
+            scope = 'self' if item.get('self_access') else 'other'
+            lines.append(
+                f"| {item.get('method', '')} | `{_markdown_cell(item.get('resolved_path') or item.get('path'))}` "
+                f"| {_markdown_cell(item.get('account_label'))} | {_markdown_cell(item.get('role'))} "
+                f"| {scope} | {item.get('status')} "
+                f"| {_markdown_cell(item.get('expected_access'))} | {_markdown_cell(item.get('expectation_source'))} "
+                f"| {_markdown_cell('; '.join(notes))} |"
+            )
+        lines.append("")
+    return "\n".join(lines)

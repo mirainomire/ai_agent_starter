@@ -1,1 +1,1 @@
-# Placeholder untuk integrasi OWASP ZAP (via API). Tambahkan sesuai kebutuhan.
+# Placeholder for OWASP ZAP integration (via API). Extend as needed.
