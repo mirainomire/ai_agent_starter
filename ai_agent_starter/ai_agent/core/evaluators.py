@@ -5,6 +5,11 @@ from .utils import normalize_path
 import os
 from pathlib import Path
 
+# Expectations from the agent's own checks rather than the configured policy (the ground truth).
+# Their outcomes are reported separately and never enter the confusion matrix.
+BUILTIN_SOURCE_PREFIX = "builtin."
+SESSION_INVALIDATION_SOURCE = BUILTIN_SOURCE_PREFIX + "session_invalidation"
+
 
 def _locate_rules_file() -> Path | None:
     # Priority: ENV override, then common locations upward from CWD
@@ -172,8 +177,10 @@ def expected_status(policy, tc: TestCase) -> Dict[str, Any]:
     # denied on any non-public route regardless of the account's nominal role.
     mutation = tc.mutation or {}
     mutation_type = str(mutation.get("type") or "").upper()
+    if mutation_type == "JWT_AFTER_LOGOUT":
+        return expectation("deny", SESSION_INVALIDATION_SOURCE)
     if (mutation.get("no_auth") or mutation.get("without_auth")
-            or mutation_type in ("NO_AUTH", "NEGATIVE_AUTH", "JWT_AFTER_LOGOUT")):
+            or mutation_type in ("NO_AUTH", "NEGATIVE_AUTH")):
         return expectation("deny", "policy.unauthenticated")
 
     # A field that only some roles may write decides the case when the request sends it.
@@ -250,6 +257,11 @@ def classify(exp: Dict[str, Any], actual_status: int) -> str:
     # Input/data quality errors are inconclusive for authz labeling.
     if sc in _STATUS_RULES.get("non_finding", set([400, 409, 422])):
         return "INCONCLUSIVE"
+    if str((exp or {}).get("expectation_source", "")).startswith(BUILTIN_SOURCE_PREFIX):
+        if _is_2xx(sc):
+            return "OUTSIDE_POLICY"
+        if sc in {401, 403}:
+            return "OUTSIDE_POLICY_PASS"
     if (exp or {}).get("expected_access") == "public":
         return "TP_ALLOW" if _is_2xx(sc) else "SKIP"
     if not status_in:
@@ -290,11 +302,19 @@ def classify(exp: Dict[str, Any], actual_status: int) -> str:
         return "FN"
     return "SKIP"
 
+def classifyResult(policy, result: Result) -> str:
+    """Classify one result. A 2xx write whose fields read back unchanged was ignored by the
+    server, so the denied write was enforced (TN) even though the request was accepted."""
+    label = classify(expected_status(policy, result.tc), result.status_code)
+    if label == "FP" and result.write_applied is False:
+        return "TN"
+    return label
+
+
 def confusion_counts(results: List[Result], policy) -> Dict[str, int]:
     c = Counter()
     for r in results:
-        exp = expected_status(policy, r.tc)
-        lab = classify(exp, r.status_code)
+        lab = classifyResult(policy, r)
         c[lab] += 1
     # Map TP_ALLOW to TP: allowed endpoints returning 200 are True Positives
     return {
@@ -307,6 +327,8 @@ def confusion_counts(results: List[Result], policy) -> Dict[str, int]:
         "SKIP": c.get("SKIP",0),
         "INCONCLUSIVE": c.get("INCONCLUSIVE",0),
         "UNVERIFIED": c.get("UNVERIFIED",0),
+        "OUTSIDE_POLICY": c.get("OUTSIDE_POLICY", 0),
+        "OUTSIDE_POLICY_PASS": c.get("OUTSIDE_POLICY_PASS", 0),
     }
 
 def metrics(cf: Dict[str, int]) -> Dict[str, float]:
@@ -345,15 +367,13 @@ def coverage(tests: List[TestCase], roles: List[str], endpoints: List[Dict[str,A
             "tested_pairs": tested_pairs, "coverage_pct": pct}
 
 def time_to_detect(results: List[Result], policy, start_ts: float) -> Dict[str, Any]:
-    """Hitung waktu hingga temuan false-allow pertama (FP) sejak start_ts.
+    """Measure the time from start_ts until the first false-allow finding (FP).
     Return a dict with seconds (float) or None, including the 1-based test index.
     """
     first_ts = None
     first_idx = None
     for idx, r in enumerate(results, start=1):
-        exp = expected_status(policy, r.tc)
-        lab = classify(exp, r.status_code)
-        if lab == "FP":
+        if classifyResult(policy, r) == "FP":
             first_ts = r.ts or None
             first_idx = idx
             break

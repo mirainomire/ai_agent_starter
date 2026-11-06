@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, List
 
 from .evaluators import (
-    classify,
+    classifyResult,
     confusion_counts,
     coverage,
     effective_account_alias,
@@ -75,10 +75,13 @@ def _fallback_summary(
     fn = counts.get("FN", 0)
     errors = counts.get("ERR", 0)
     unverified = counts.get("UNVERIFIED", 0)
+    outside_policy = counts.get("OUTSIDE_POLICY", 0)
     if not metric_values.get("evaluated_cases", 0):
         assessment = "Incomplete: no cases could be evaluated against explicit access expectations."
     elif fp:
         assessment = "Review required: access was allowed where the configured policy expected denial."
+    elif outside_policy:
+        assessment = "Review required: built-in checks found behavior the configured policy does not cover."
     elif unverified:
         assessment = "Incomplete: some operations have no matching access expectation."
     elif counts.get("INCONCLUSIVE", 0):
@@ -94,6 +97,7 @@ def _fallback_summary(
         "Missing expectations are unverified and are not treated as findings.", "",
         f"- Outcomes: {total}",
         f"- Unexpected allowed outcomes (FP): {fp}",
+        f"- Findings outside the configured policy (not in metrics): {outside_policy}",
         f"- Unexpected denied outcomes (FN): {fn}",
         f"- Server errors: {errors}",
         f"- Not found / inconclusive: {counts.get('NF', 0)}",
@@ -105,7 +109,7 @@ def _fallback_summary(
         "", "## Cases for review", "",
     ]
     review_items = (
-        classified.get("FP", []) + classified.get("FN", [])
+        classified.get("FP", []) + classified.get("OUTSIDE_POLICY", []) + classified.get("FN", [])
         + classified.get("INCONCLUSIVE", [])
         + classified.get("UNVERIFIED", [])
     )
@@ -158,7 +162,8 @@ def save_json_report(
     coverage_data = coverage(tests, roles, endpoints)
     detection = time_to_detect(results, policy, start_ts)
     classified: Dict[str, list] = {
-        key: [] for key in ("TP", "TN", "FP", "FN", "NF", "ERR", "SKIP", "INCONCLUSIVE", "UNVERIFIED")
+        key: [] for key in ("TP", "TN", "FP", "FN", "NF", "ERR", "SKIP", "INCONCLUSIVE", "UNVERIFIED",
+                            "OUTSIDE_POLICY", "OUTSIDE_POLICY_PASS")
     }
 
     serialized_results = []
@@ -166,7 +171,7 @@ def save_json_report(
     for result in results:
         tc = result.tc
         expectation = expected_status(policy, tc)
-        label = classify(expectation, result.status_code)
+        label = classifyResult(policy, result)
         key = {"TP_ALLOW": "TP", "NOT_FOUND": "NF", "ERROR": "ERR"}.get(label, label)
         row = {
             "method": tc.method,
@@ -183,6 +188,7 @@ def save_json_report(
             "self_access": tc.self_access,
             "status": result.status_code,
             "classification": label,
+            "write_applied": result.write_applied,
             "expected_access": expectation.get("expected_access", "unknown"),
             "expectation_source": expectation.get("expectation_source", "unknown"),
             "ai_expectation_hypothesis": _llm_expectation_hypothesis(tc.mutation),
@@ -229,6 +235,8 @@ def save_json_report(
             "FP": "expected DENY, observed 2xx",
             "UNVERIFIED": "no explicit access expectation matched this case",
             "INCONCLUSIVE": "request sent but validation or resource state prevents an authorization verdict",
+            "OUTSIDE_POLICY": "a built-in check (not the configured policy) expected DENY, observed 2xx; not in metrics",
+            "OUTSIDE_POLICY_PASS": "a built-in check (not the configured policy) expected DENY, observed 401/403; not in metrics",
         },
         "confusion": counts,
         "metrics": metric_values,
@@ -242,6 +250,7 @@ def save_json_report(
             "result_records": len(results),
             "evaluated_cases": int(metric_values.get("evaluated_cases", 0)),
             "potential_vulnerabilities": int(counts.get("FP", 0)),
+            "findings_outside_policy": int(counts.get("OUTSIDE_POLICY", 0)),
             "unverified_cases": int(counts.get("UNVERIFIED", 0)),
         },
         "llm_summary": summary,
@@ -285,6 +294,8 @@ def render_markdown_report(data: Dict[str, Any]) -> str:
 
     label_titles = {
         "FP": "FP — allowed, but policy expected deny (review required)",
+        "OUTSIDE_POLICY": "Outside the configured policy — built-in check failed (review required; not in metrics)",
+        "OUTSIDE_POLICY_PASS": "Outside the configured policy — built-in check passed (not in metrics)",
         "FN": "FN — denied, but policy expected allow",
         "INCONCLUSIVE": "INCONCLUSIVE — rejected by validation or resource state",
         "UNVERIFIED": "UNVERIFIED — no matching policy expectation",
@@ -294,7 +305,8 @@ def render_markdown_report(data: Dict[str, Any]) -> str:
         "TN": "TN — denied as expected",
         "TP": "TP — allowed as expected",
     }
-    label_order = ["FP", "FN", "INCONCLUSIVE", "UNVERIFIED", "NF", "ERR", "SKIP", "TN", "TP"]
+    label_order = ["FP", "OUTSIDE_POLICY", "FN", "INCONCLUSIVE", "UNVERIFIED", "NF", "ERR", "SKIP", "TN", "TP",
+                   "OUTSIDE_POLICY_PASS"]
 
     lines.extend(["", "## Results", ""])
     for label in label_order:
@@ -316,6 +328,8 @@ def render_markdown_report(data: Dict[str, Any]) -> str:
             attempts = [attempt for attempt in (item.get('attempts') or []) if attempt.get('path')]
             if len(attempts) > 1:
                 notes.append("steps: " + ", ".join(f"{attempt['path']}→{attempt['status']}" for attempt in attempts[:4]))
+            if item.get('write_applied') is not None:
+                notes.append("written field read back: " + ("changed" if item['write_applied'] else "unchanged (write ignored)"))
             for decision in (item.get('recovery') or []):
                 notes.append(f"recovery: {decision.get('action')}")
             scope = 'self' if item.get('self_access') else 'other'

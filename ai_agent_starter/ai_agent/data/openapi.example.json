@@ -1,0 +1,81 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Example API (generic sample, safe to publish)",
+    "version": "1.0.0",
+    "description": "Copy this file to openapi.json and replace it with your target API's specification before running a scan: cp ai_agent/data/openapi.example.json ai_agent/data/openapi.json"
+  },
+  "paths": {
+    "/auth/login/": {
+      "post": {
+        "summary": "Obtain an access token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["username", "password"],
+                "properties": {
+                  "username": {"type": "string"},
+                  "password": {"type": "string"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {"200": {"description": "Token issued"}}
+      }
+    },
+    "/notes/": {
+      "get": {"summary": "List notes", "responses": {"200": {"description": "OK"}}},
+      "post": {
+        "summary": "Create a note",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["title"],
+                "properties": {
+                  "title": {"type": "string"},
+                  "body": {"type": "string"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {"201": {"description": "Created"}}
+      }
+    },
+    "/notes/{id}/": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+      "get": {"summary": "Read a note", "responses": {"200": {"description": "OK"}}},
+      "put": {"summary": "Update a note", "responses": {"200": {"description": "OK"}}},
+      "delete": {"summary": "Delete a note", "responses": {"204": {"description": "Deleted"}}}
+    },
+    "/users/": {
+      "get": {"summary": "List users (admin only)", "responses": {"200": {"description": "OK"}}}
+    },
+    "/users/{id}/": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+      "get": {"summary": "Read a user", "responses": {"200": {"description": "OK"}}},
+      "put": {
+        "summary": "Update a user",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": {"type": "string"},
+                  "role": {"type": "string", "description": "Admin-only; read-only for others"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {"200": {"description": "OK"}}
+      }
+    }
+  }
+}

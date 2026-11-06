@@ -29,6 +29,15 @@ SELECTABLE_METHODS = ("get", "put", "patch", "post")
 MAX_FIELD_CHARS = 60
 
 
+def singularResource(segment: str) -> str:
+    segment = segment.lower()
+    if segment.endswith('ies'):
+        return segment[:-3] + 'y'
+    if segment.endswith('s'):
+        return segment[:-1]
+    return segment
+
+
 def resourceKeyForPlaceholder(path: str, placeholder: str) -> str:
     """Name the resource a path placeholder refers to, e.g. /users/{id}/ -> user."""
     if placeholder.lower() != 'id':
@@ -36,12 +45,27 @@ def resourceKeyForPlaceholder(path: str, placeholder: str) -> str:
     match = re.search(r"/([^/{}]+)/\{id\}", path or "")
     if not match:
         return placeholder
-    segment = match.group(1).lower()
-    if segment.endswith('ies'):
-        return segment[:-3] + 'y'
-    if segment.endswith('s'):
-        return segment[:-1]
-    return segment
+    return singularResource(match.group(1))
+
+
+def isAccountIdentityPlaceholder(path: str, placeholder: str) -> bool:
+    """True when the placeholder is filled with a configured account's own user ID."""
+    return placeholder in ('user_id', 'id_user') or resourceKeyForPlaceholder(path, placeholder) == 'user'
+
+
+def accountRecordTemplate(path_template: str) -> Optional[str]:
+    """Return the prefix that addresses an account record itself, e.g. /users/{id}/ for /users/{id}/role/.
+
+    Paths that only key other data by user ID, such as /payroll/{user_id}/, are not account records.
+    """
+    segments = [segment for segment in (path_template or "").split("/") if segment]
+    for index in range(1, len(segments)):
+        match = re.fullmatch(r"\{([^}/]+)\}", segments[index])
+        if not match or not isAccountIdentityPlaceholder(path_template, match.group(1)):
+            continue
+        if singularResource(segments[index - 1]) == resourceKeyForPlaceholder(path_template, match.group(1)):
+            return "/" + "/".join(segments[:index + 1]) + "/"
+    return None
 
 
 def resourceKeyAliases(resource_key: str) -> List[str]:

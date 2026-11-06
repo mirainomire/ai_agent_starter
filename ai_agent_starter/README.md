@@ -13,12 +13,11 @@ The dataset is **self-curated** and **author-created** for this research (self-c
 
 The project uses structured security testing data in `ai_agent/data`:
 
-- `openapi.json`: OpenAPI specification (authored for the experimental API) used to discover endpoints, parameters, and payload shapes.
-- `roles.csv`: list of roles defined in the test environment.
-- `permissions.csv`: list of defined permissions/actions.
-- `role_permission.csv`: role-to-permission mapping.
-- `rbac_matrix.csv`: flattened role-permission matrix used by the orchestrator/planning logic.
-- `rbac_rules.json`: optional/legacy artifact (not the primary runtime source for policy checks).
+- `openapi.json` — **Required.** OpenAPI specification (authored for the experimental API) used to discover endpoints, parameters, and payload shapes. This is the only data file a scan actually needs.
+- `rbac_matrix.csv` — **Optional.** Flattened role-permission matrix passed to the LLM prompt as context only. The run works without it (it is loaded in a try/except and skipped if missing); classification comes from `policy.yaml`, not this file.
+- `roles.csv` — **Optional.** Used only as a fallback role list when `policy.yaml`/`auth.yaml` define no roles, and as input to the RBAC-matrix helper script.
+- `permissions.csv` — **Optional.** Input to the `generate_rbac_matrix.py` helper script only; not read during a scan.
+- `role_permission.csv` — **Optional.** Role-to-permission mapping; input to the `generate_rbac_matrix.py` helper script only; not read during a scan.
 
 ### Dataset Purpose
 - Define the access model and expected authorization behavior.
@@ -28,7 +27,7 @@ The project uses structured security testing data in `ai_agent/data`:
 ## Code Information
 Main code package: `ai_agent`
 
-Core modules:
+Core modules (all **required** — internal to the package):
 - `ai_agent/core/orchestrator.py`: end-to-end flow controller (load config, plan, execute, evaluate, report).
 - `ai_agent/core/tools_auth.py`: role login/token acquisition and identity mapping.
 - `ai_agent/core/tools_http.py`: HTTP execution with retries, auth header injection, and artifact persistence.
@@ -37,34 +36,41 @@ Core modules:
 - `ai_agent/core/utils.py`: helper loaders/parsers for YAML/JSON/CSV/OpenAPI.
 
 Runtime/config files:
-- `ai_agent/config/agent.yaml`
-- `ai_agent/config/auth.yaml`
-- `ai_agent/config/policy.yaml` (canonical runtime policy file)
+- `ai_agent/config/agent.yaml` — **Required.** Base URL and execution settings.
+- `ai_agent/config/auth.yaml` — **Required.** Login endpoint, credential fields, and the accounts/roles to test.
+- `ai_agent/config/policy.yaml` — **Required.** Canonical runtime policy file; the verdict oracle for allow/deny.
 
 Entry points:
-- `byebac.py` (CLI)
-- `ai_agent/scripts/run_agent.py` (direct runner)
+- `byebac.py` — **Required** (CLI; the normal way to run).
+- `ai_agent/scripts/run_agent.py` — **Optional** alternative direct runner.
+
+Helper scripts (none are needed for a scan):
+- `ai_agent/scripts/generate_rbac_matrix.py` — **Optional.** Regenerates `rbac_matrix.csv` from the three CSVs.
+- `ai_agent/scripts/check_setup.py` — **Optional.** Pre-flight validation of config/data files.
 
 ## Usage Instructions
 ### Step-by-Step Quick Start (Reviewer Friendly)
 Run from project root (`ai_agent_starter`):
 
 ```bash
-# 1) Install dependencies
+# 1) Install dependencies            [REQUIRED]
 pip install -r requirements.txt
 
-# 2) Validate setup
+# 2) Validate setup                  [OPTIONAL] pre-flight check only
 byebac /check
 
-# 3) Execute BAC scan
+# 3) Execute BAC scan                [REQUIRED] this is the actual scan
 byebac /runagent
 
-# 4) Check run summary
+# 4) Check run summary               [OPTIONAL] prints metrics of the last run
 byebac /status
 
-# 5) Open latest report path
+# 5) Open latest report path         [OPTIONAL] shows where the report was saved
 byebac /report
 ```
+
+Only steps 1 and 3 are needed to produce a report. Steps 2, 4, and 5 are
+convenience commands.
 
 If `byebac` command is not available in your shell, use:
 
@@ -92,12 +98,46 @@ source .venv/bin/activate  # Linux/macOS
 pip install -r requirements.txt
 ```
 
+> **Private inputs.** The real `ai_agent/config/policy.yaml`, `policy.json`,
+> `ai_agent/data/openapi.json` and the RBAC CSVs are gitignored because they
+> describe a private target API. The repo ships generic stubs instead. Before
+> your first run, copy the stubs and edit them for your API:
+>
+> ```bash
+> cp ai_agent/config/policy.example.yaml ai_agent/config/policy.yaml
+> cp ai_agent/data/openapi.example.json ai_agent/data/openapi.json
+> ```
+
+#### Private-files cheat sheet
+Handy commands for working with the gitignored private inputs and their stubs:
+
+```bash
+# Set up the real files from the published stubs (first-time setup)
+cp ai_agent/config/policy.example.yaml ai_agent/config/policy.yaml
+cp ai_agent/data/openapi.example.json ai_agent/data/openapi.json
+
+# An example stub was deleted by accident? Restore it from git (stubs are tracked)
+git checkout -- ai_agent/config/policy.example.yaml ai_agent/data/openapi.example.json
+
+# List every file git is ignoring, including your private copies
+git status --ignored --short
+
+# Confirm your private files are NOT tracked (prints nothing = safe to push)
+git ls-files ai_agent/config/policy.yaml ai_agent/config/policy.json \
+  ai_agent/data/openapi.json ai_agent/data/roles.csv \
+  ai_agent/data/permissions.csv ai_agent/data/role_permission.csv \
+  ai_agent/data/rbac_matrix.csv
+
+# Verify a specific file is ignored (prints the path = ignored)
+git check-ignore ai_agent/config/policy.yaml ai_agent/data/openapi.json
+```
+
 ### 2) Configure runtime inputs
-1. Update `ai_agent/config/agent.yaml` with your `base_url` and execution settings.  
-2. Update `ai_agent/config/auth.yaml` with login endpoint, credential fields, and role definitions.  
-3. Update `ai_agent/config/policy.yaml` with allow/deny RBAC expectations.  
-4. Ensure `ai_agent/data/openapi.json` and RBAC CSV files are present and aligned with target API behavior.  
-5. Set environment variables for credentials and API keys (if LLM features are enabled).
+1. **Required** — update `ai_agent/config/agent.yaml` with your `base_url` and execution settings.  
+2. **Required** — update `ai_agent/config/auth.yaml` with login endpoint, credential fields, and role definitions.  
+3. **Required** — update `ai_agent/config/policy.yaml` with allow/deny RBAC expectations.  
+4. **Required** — ensure `ai_agent/data/openapi.json` is present and aligned with target API behavior. The RBAC CSV files are **optional** (LLM prompt context / helper-script input only).  
+5. **Optional** — set environment variables for credentials and API keys (only if LLM features are enabled).
 
 ### 3) Run the agent
 From project root:
@@ -162,7 +202,7 @@ inputs and research datasets.
   API. State-changing methods and configured fixtures are skipped unless
   `execution.allow_state_changes` is enabled for an authorized test target.
 
-Optional cleanup after testing:
+Optional cleanup after testing (**optional** — removes run artifacts only):
 
 ```bash
 byebac /clean
@@ -175,15 +215,15 @@ Minimum software/runtime requirements:
 - Network access to target API under test
 
 Python dependencies (from `requirements.txt`):
-- `openai>=1.12.0`
-- `requests>=2.31.0`
-- `pyyaml>=6.0`
-- `pandas>=2.0.0`
-- `python-dotenv>=1.0.0`
-- `rich>=13.0.0`
-- `google-generativeai>=0.8.0` (optional/fallback)
-- `google-genai>=0.2.0` (optional/preferred for Gemini)
-- `pyfiglet>=0.8.post1`
+- `requests>=2.31.0` — **Required** (HTTP execution).
+- `pyyaml>=6.0` — **Required** (config loading).
+- `pandas>=2.0.0` — **Required** (CSV/RBAC-matrix loading).
+- `python-dotenv>=1.0.0` — **Required** (reads `.env`).
+- `rich>=13.0.0` — **Required** (CLI output).
+- `pyfiglet>=0.8.post1` — **Optional** (CLI banner only).
+- `openai>=1.12.0` — **Optional** (only if LLM-assisted planning is enabled).
+- `google-generativeai>=0.8.0` — **Optional** (Gemini fallback).
+- `google-genai>=0.2.0` — **Optional** (preferred Gemini client).
 
 ## Methodology
 High-level testing methodology:

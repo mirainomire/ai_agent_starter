@@ -1,0 +1,91 @@
+# Example access policy (generic sample API, safe to publish).
+#
+# Copy this file to `policy.yaml` and replace the endpoints/roles with your own
+# target API before running a scan:
+#   cp ai_agent/config/policy.example.yaml ai_agent/config/policy.yaml
+#
+# Schema notes:
+# - `rules`: one HTTP method + path pair per entry, with the roles allowed to call it.
+# - `public_endpoints`: routes reachable without authentication (METHOD:/path).
+# - `field_rules`: fields only certain roles may write (e.g. an admin-only `role`).
+# - `request_examples`: seed bodies for POST/PUT so write probes send valid payloads.
+# - `account_role_map`: maps each account alias in auth.yaml to its policy role.
+# - `default_action`: verdict for any request with no matching rule (`deny` is safest).
+total_endpoints: 8
+roles:
+  Admin:
+    access: all endpoint operations
+  Member:
+    access: own-resource or explicitly authenticated operations; admin-only operations denied
+default_action: deny
+rules:
+- method: GET
+  path: /notes/
+  allow:
+  - role: Admin
+    self: any
+  - role: Member
+    self: any
+- method: POST
+  path: /notes/
+  allow:
+  - role: Admin
+    self: any
+  - role: Member
+    self: any
+- method: GET
+  path: /notes/{id}/
+  allow:
+  - role: Admin
+    self: any
+  - role: Member
+    self: own
+- method: PUT
+  path: /notes/{id}/
+  allow:
+  - role: Admin
+    self: any
+  - role: Member
+    self: own
+- method: DELETE
+  path: /notes/{id}/
+  allow:
+  - role: Admin
+    self: any
+- method: GET
+  path: /users/
+  allow:
+  - role: Admin
+    self: any
+- method: GET
+  path: /users/{id}/
+  allow:
+  - role: Admin
+    self: any
+  - role: Member
+    self: own
+- method: PUT
+  path: /users/{id}/
+  allow:
+  - role: Admin
+    self: any
+  - role: Member
+    self: own
+field_rules:
+- method: PUT
+  path: /users/{id}/
+  field: role
+  value: admin
+  allow_roles:
+  - Admin
+public_endpoints:
+- POST:/auth/login/
+request_examples:
+  POST /notes/:
+    title: Example note
+    body: Sample content
+  PUT /users/{id}/:
+    role: admin
+account_role_map:
+  admin_account: Admin
+  member_account: Member

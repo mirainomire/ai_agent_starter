@@ -10,10 +10,12 @@ from ai_agent.core.tools_auth import AuthManager
 from ai_agent.core.memory import Memory, TestCase, Result
 from datetime import date as date_cls, datetime as datetime_cls, timezone as timezone_cls
 from ai_agent.core.catalog_policy import findRequestExample, makeUnique, resolveExample
-from ai_agent.core.id_selection import buildIdSlots, resourceKeyAliases, resourceKeyForPlaceholder, responseItems, selectIdsWithLlm
+from ai_agent.core.id_selection import (accountRecordTemplate, buildIdSlots, isAccountIdentityPlaceholder,
+                                        resourceKeyAliases, resourceKeyForPlaceholder, responseItems,
+                                        selectIdsWithLlm)
 from ai_agent.core.reporters import save_json_report
 from ai_agent.core.utils import load_rbac_matrix, get_all_roles, get_role_permissions
-from ai_agent.core.evaluators import classify, effective_account_alias, effective_policy_role, expected_status
+from ai_agent.core.evaluators import classifyResult, effective_account_alias, effective_policy_role, expected_status
 import os
 from pathlib import Path
 
@@ -709,7 +711,7 @@ def execute(memory: Memory, http: HttpClient, auth: AuthManager, policy: dict, t
 
     def _lookup_resource_id(owner_role: str, placeholder: str, path: str = "") -> int | None:
         resource_key = resourceKeyForPlaceholder(path, placeholder)
-        if placeholder in ('user_id', 'id_user') or resource_key == 'user':
+        if isAccountIdentityPlaceholder(path, placeholder):
             return auth.get_user_id(owner_role)
         rid_map = memory.resource_ids.get(owner_role) or {}
         # A bare {id} is ambiguous across collections; never read the generic pool.
@@ -1032,6 +1034,64 @@ def execute(memory: Memory, http: HttpClient, auth: AuthManager, policy: dict, t
         memory.store_resource_id(owner_alias, resourceKeyForPlaceholder(f"{collection_path}{{{placeholder}}}", placeholder), resource_id)
         return resource_id
 
+    def _protectedAccountRecord(path_template: str, resolved_path: str) -> Optional[Tuple[str, str, str]]:
+        """Return (account, record template, record path) when a request addresses a configured
+        test account's own record; changing or deleting it would break every later request."""
+        record_template = accountRecordTemplate(path_template)
+        if record_template is None:
+            return None
+        depth = len([segment for segment in record_template.split("/") if segment])
+        resolved_segments = [segment for segment in str(resolved_path or "").split("?")[0].split("/") if segment]
+        if len(resolved_segments) < depth or not resolved_segments[depth - 1].isdigit():
+            return None
+        record_id = int(resolved_segments[depth - 1])
+        account = next((alias for alias in auth.roles if auth.get_user_id(alias) == record_id), None)
+        if account is None:
+            return None
+        return account, record_template, normalize_path("/" + "/".join(resolved_segments[:depth]) + "/")
+
+    def _unchangedAccountBody(account: str, record_template: str, record_path: str,
+                              planned_body: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Repeat the account's current values so an allowed write still changes nothing."""
+        if ("GET", normalize_path(record_template)) not in openapi_set:
+            return None
+        current = http.request("GET", record_path, token=auth.get_token(account), role=account,
+                               bac_type="fixture", test_context={"fixture": "account_snapshot"})
+        current_body = current.get("body")
+        if not 200 <= int(current.get("status_code", 0)) < 300 or not isinstance(current_body, dict):
+            return None
+        record = current_body.get("data") if isinstance(current_body.get("data"), dict) else current_body
+        field_names = list(planned_body) if planned_body else list(record)
+        unchanged = {name: record[name] for name in field_names if name in record}
+        return unchanged or None
+
+    def _fieldWriteApplied(token: Optional[str], actor: str, path_template: str, write_path: str,
+                           sent_fields: Dict[str, Any]) -> Tuple[Optional[bool], Dict[str, Any]]:
+        """Read the written record back. An accepted write can still ignore read-only fields,
+        so only the stored values show whether a privileged field really changed.
+        Returns (True if every sent field holds the sent value, False if any does not,
+        None if the record cannot be read) plus the verification step for the report."""
+        read_template, read_path = normalize_path(path_template), normalize_path(write_path)
+        if ("GET", read_template) not in openapi_set:
+            # Sub-actions such as /items/{id}/approve/ are read through their item path.
+            read_template = normalize_path(re.sub(r"(\{[^}/]+\})/[^{}]*$", r"\1/", path_template))
+            depth = len([segment for segment in read_template.split("/") if segment])
+            read_path = normalize_path("/" + "/".join([s for s in write_path.split("/") if s][:depth]) + "/")
+        step: Dict[str, Any] = {"path": read_path, "phase": "verify_field_write"}
+        if ("GET", read_template) not in openapi_set:
+            return None, {**step, "status": None, "reason": "no GET operation to read the record back"}
+        current = http.request("GET", read_path, token=token, role=actor, bac_type="fixture",
+                               test_context={"fixture": "field_write_verification"})
+        step["status"] = current.get("status_code")
+        body = current.get("body")
+        if not 200 <= int(current.get("status_code", 0)) < 300 or not isinstance(body, dict):
+            return None, step
+        record = body.get("data") if isinstance(body.get("data"), dict) else body
+        if any(name not in record for name in sent_fields):
+            return None, {**step, "reason": "written field not present in the record"}
+        applied = all(str(record[name]).lower() == str(value).lower() for name, value in sent_fields.items())
+        return applied, {**step, "applied": applied}
+
     def _employeeUserId(owner_alias: str) -> int | None:
         """Catalog bodies name an employee; an admin owner borrows an employee account."""
         if auth.get_policy_role(owner_alias).strip().lower() == "employee":
@@ -1070,28 +1130,25 @@ def execute(memory: Memory, http: HttpClient, auth: AuthManager, policy: dict, t
         if not user_id or not actor_token:
             memory.record_result(Result(tc, 0, {"reason": "Disposable escalation actor could not be created or logged in"}))
             return
-        evidence_context = {"fixture": "escalation_evidence", "actor_account": username}
-        before = http.request("GET", "/users/", token=actor_token, role=tc.role, bac_type="fixture",
-                              test_context=evidence_context)
         resolved_path = normalize_path(re.sub(r"\{[^}/]+\}", str(user_id), tc.path))
-        response = http.request(tc.method, resolved_path, token=actor_token, json_body=dict(mut.get("json") or {}),
+        sent_fields = dict(mut.get("json") or {})
+        response = http.request(tc.method, resolved_path, token=actor_token, json_body=sent_fields,
                                 role=tc.role, bac_type="vertical",
                                 test_context={"self_access": True, "mutation": mut, "actor_account": username})
-        after = http.request("GET", "/users/", token=actor_token, role=tc.role, bac_type="fixture",
-                             test_context=evidence_context)
+        write_applied, verification = None, None
+        if 200 <= int(response.get("status_code", 0)) < 300 and sent_fields:
+            write_applied, verification = _fieldWriteApplied(actor_token, tc.role, tc.path, resolved_path, sent_fields)
         if admin_alias:
             http.request("PUT", f"/users/{user_id}/role/", token=auth.get_token(admin_alias),
                          json_body={"role": "employee"}, role=admin_alias, bac_type="fixture",
                          test_context={"fixture": "escalation_cleanup"})
-        evidence = [
-            {"path": "/users/", "phase": "before_field_write", "status": before.get("status_code")},
-            {"path": resolved_path, "phase": "field_write", "status": response.get("status_code"),
-             "artifact": response.get("artifact")},
-            {"path": "/users/", "phase": "after_field_write", "status": after.get("status_code")},
-        ]
+        evidence = [{"path": resolved_path, "phase": "field_write", "status": response.get("status_code"),
+                     "artifact": response.get("artifact")}]
+        if verification:
+            evidence.append(verification)
         memory.record_result(Result(tc=tc, status_code=response.get("status_code", 0), body=response.get("body", {}),
                                     ts=time.time(), artifact=response.get("artifact"), resolved_path=resolved_path,
-                                    target_account=tc.role, attempts=evidence))
+                                    target_account=tc.role, attempts=evidence, write_applied=write_applied))
 
     def _runJwtAfterLogout(tc: TestCase, mut: Dict[str, Any]) -> None:
         """Session invalidation probe: reuse an access token after its owner logs out."""
@@ -1414,6 +1471,43 @@ def execute(memory: Memory, http: HttpClient, auth: AuthManager, policy: dict, t
             except Exception:
                 json_body = None
 
+        # A method-override header makes a GET act as the overriding method on servers that honor it.
+        override_method = str(extra_headers.get("X-HTTP-Method-Override") or "").upper()
+        effective_method = override_method or method_upper
+        protected = (_protectedAccountRecord(tc.path, path)
+                     if effective_method in ("PUT", "PATCH", "DELETE") else None)
+        if protected is not None and effective_method == "DELETE" and not tc.self_access:
+            # Another user's record can be replaced by a disposable one; the actor's own cannot.
+            record_template, record_path = protected[1], protected[2]
+            record_placeholder = _extract_placeholders(record_template)[-1]
+            collection_path = normalize_path(re.sub(r"\{[^}/]+\}/?$", "", record_template))
+            disposable_id = _create_fixture_via_openapi(target_owner, collection_path, record_placeholder)
+            if disposable_id and all(auth.get_user_id(alias) != disposable_id for alias in auth.roles):
+                disposable_record = record_template.replace("{" + record_placeholder + "}", str(disposable_id))
+                path = normalize_path(disposable_record.rstrip("/") + path[len(record_path.rstrip("/")):])
+                protected = None
+        if protected is not None:
+            account, record_template, record_path = protected
+            safe_body = None if effective_method == "DELETE" else _unchangedAccountBody(
+                account, record_template, record_path, json_body)
+            if safe_body is None:
+                reason = (f"{effective_method} would modify configured test account '{account}' ({record_path}); "
+                          "no unchanged body or disposable record was available")
+                memory.record_result(Result(tc=tc, status_code=0, body={"skipped": True, "reason": reason},
+                                            ts=time.time(), artifact=None, resolved_path=path, target_account=target_owner))
+                print(f"[SKIP] {tc.method} {path} - {reason}", flush=True)
+                return
+            # Plain request: smart_request's 400 repair could add fields such as a new password.
+            resp = http.request(tc.method, path, token=token, params=params, json_body=safe_body,
+                                extra_headers=extra_headers, role=as_role, bac_type=bac_type,
+                                test_context={**test_context, "protected_account": account,
+                                              "body": "current values only"})
+            memory.record_result(Result(tc=tc, status_code=resp.get("status_code", 0), body=resp.get("body", {}),
+                                        ts=time.time(), artifact=resp.get("artifact"), resolved_path=path,
+                                        target_account=target_owner))
+            print(f"[RUN] {tc.method} {path} (current values of '{account}') -> {resp.get('status_code')}", flush=True)
+            return
+
         # DEBUG: Print json_body value before smart_request
         print(f"[DEBUG-ORCHESTRATOR] {tc.method} {path} - json_body type: {type(json_body)}, value: {json_body}", flush=True)
 
@@ -1451,7 +1545,10 @@ def execute(memory: Memory, http: HttpClient, auth: AuthManager, policy: dict, t
                 if candidate is None:
                     break
                 attempted_ids.add(candidate)
-                path = normalize_path(tc.path.replace('{' + ph + '}', str(candidate)))
+                candidate_path = normalize_path(tc.path.replace('{' + ph + '}', str(candidate)))
+                if _protectedAccountRecord(tc.path, candidate_path) is not None:
+                    break
+                path = candidate_path
                 test_context['resource_retry'] = {'reason': HttpClient._error_text_from_response(resp),
                                                   'target_id': candidate}
                 resp = http.smart_request(
@@ -1467,7 +1564,10 @@ def execute(memory: Memory, http: HttpClient, auth: AuthManager, policy: dict, t
                     records.pop(current_id, None)
         from .resource_recovery import recover_resource
         owner = target_owner
-        def send_recovery(retry_path):
+        def send_recovery(retry_path: str) -> Dict[str, Any]:
+            if method_upper in ("PUT", "PATCH", "DELETE") and _protectedAccountRecord(tc.path, retry_path) is not None:
+                return {"status_code": 0, "body": {"skipped": True,
+                                                   "reason": f"recovery target {retry_path} is a configured test account"}}
             return http.smart_request(
                 method=tc.method, path=retry_path, token=token, openapi=openapi,
                 params=params, extra_headers=extra_headers, json_body=json_body,
@@ -1583,8 +1683,14 @@ def execute(memory: Memory, http: HttpClient, auth: AuthManager, policy: dict, t
                     [placeholders[0]] + resourceKeyAliases(resourceKeyForPlaceholder(tc.path, placeholders[0])),
                     deleted_id,
                 )
+        write_applied = None
+        sent_fields = mut.get("json") if isinstance(mut.get("json"), dict) else {}
+        if (str(mut.get("type") or "").upper() == "ADMIN_FIELD_WRITE" and sent_fields
+                and 200 <= int(resp.get("status_code", 0)) < 300):
+            write_applied, verification = _fieldWriteApplied(token, as_role, tc.path, path, sent_fields)
+            attempts = list(attempts or []) + [verification]
         import time as _t
-        memory.record_result(Result(tc=tc, status_code=resp["status_code"], body=resp.get("body", {}), ts=_t.time(), artifact=resp.get("artifact"), resolved_path=path, target_account=owner, attempts=attempts, recovery=recovery))
+        memory.record_result(Result(tc=tc, status_code=resp["status_code"], body=resp.get("body", {}), ts=_t.time(), artifact=resp.get("artifact"), resolved_path=path, target_account=owner, attempts=attempts, recovery=recovery, write_applied=write_applied))
         # Realtime progress: after request
         try:
             payload_info = resp.get('payload_info', {})
@@ -1895,7 +2001,7 @@ def observe(results: List[Result], policy: dict) -> List[Dict[str, Any]]:
     observations = []
     for r in results:
         exp = expected_status(policy, r.tc)
-        classification = classify(exp, r.status_code)
+        classification = classifyResult(policy, r)
         verdict = "mismatch" if classification in ("FP", "FN") else "ok"
         # Conventional ALLOW-positive matrix: FP is a false allow, i.e. an
         # authorization bypass where policy expected DENY.
@@ -2899,12 +3005,9 @@ class AgentOrchestrator:
             prompt_template = prompt_path.read_text(encoding="utf-8")
             
             # Collect vulnerability details
-            from .evaluators import expected_status, classify
             vulnerabilities_list = []
             for r in results:
-                exp = expected_status(policy, r.tc)
-                lab = classify(exp, r.status_code)
-                if lab == "FP":  # Conventional false allow = potential BAC
+                if classifyResult(policy, r) == "FP":  # Conventional false allow = potential BAC
                     vulnerabilities_list.append({
                         "method": r.tc.method,
                         "path": r.tc.path,

@@ -27,6 +27,15 @@ ai_agent/venv/
 ai_agent/runs/
 ai_agent/data/test_scenarios.csv
 
+# Private target data (keep local; publish only the *.example.* stubs)
+ai_agent/config/policy.yaml
+ai_agent/config/policy.json
+ai_agent/data/openapi.json
+ai_agent/data/roles.csv
+ai_agent/data/permissions.csv
+ai_agent/data/role_permission.csv
+ai_agent/data/rbac_matrix.csv
+
 # OS/editor noise
 .DS_Store
 Thumbs.db

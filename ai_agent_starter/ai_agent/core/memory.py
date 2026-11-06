@@ -21,6 +21,8 @@ class Result:
     target_account: Optional[str] = None
     attempts: List[Dict[str, Any]] = field(default_factory=list)
     recovery: List[Dict[str, Any]] = field(default_factory=list)
+    # For field-write probes: whether reading the record back showed the sent values (None = not verified).
+    write_applied: Optional[bool] = None
 
 @dataclass
 class Memory:

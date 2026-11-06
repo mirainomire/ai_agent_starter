@@ -1,3 +1,0 @@
-role_id,role_name,role_code,role_desc,permission_count
-1,Admin,admin,HRIS administrator with access to all modules and employee records.,56
-2,Employee,employee,"Employee access scoped to own HRIS records, subject to the endpoint policy.",40
