@@ -38,7 +38,7 @@ The LLM does not determine the expected authorization outcome or assign TP, FP, 
 - Top-p: `1.0`
 - Thinking level for structured selection: `MINIMAL`
 - Maximum summary output: 2,000 tokens
-- Identifier selection output: `max(3000, 220 * number_of_slots)` tokens
+- Identifier selection output: `max(2000, 120 * number_of_slots)` tokens
 
 Structured identifier selection uses a JSON response schema. API requests are sent directly by `HttpClient` to the target API and are not routed through Gemini. The model is not given credentials, authorization headers, source code, raw request or response bodies, or complete OAS and policy files.
 
