@@ -284,9 +284,6 @@ class ReportingTests(unittest.TestCase):
                 run_metadata={"provider": "test"},
             )
             report = json.loads(report_path.read_text(encoding="utf-8"))
-            scenarios = (
-                Path(temp_dir) / "ai_agent" / "data" / "test_scenarios.csv"
-            ).read_text(encoding="utf-8")
 
         self.assertEqual(report["summary"]["generated_cases"], 2)
         self.assertEqual(report["summary"]["result_records"], 1)
@@ -294,8 +291,6 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(report["results"][0]["actor_account"], "Employee_2")
         self.assertEqual(report["results"][0]["actor_role"], "Employee")
         self.assertEqual(report["label_schema"]["positive_class"], "ALLOW")
-        self.assertIn("actor_account,actor_role", scenarios.splitlines()[0])
-        self.assertIn("Employee_2,Employee", scenarios.splitlines()[1])
 
 
 if __name__ == "__main__":

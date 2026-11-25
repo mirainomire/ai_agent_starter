@@ -25,7 +25,6 @@ ai_agent/venv/
 
 # Runtime outputs (reports, artifacts, and generated test results)
 ai_agent/runs/
-ai_agent/data/test_scenarios.csv
 
 # Private target data (keep local; publish only the *.example.* stubs)
 ai_agent/config/policy.yaml

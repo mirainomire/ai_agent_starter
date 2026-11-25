@@ -147,21 +147,22 @@ def show_information():
             'title': '🚀 Run AI Security Testing Agent',
             'description': f"""
 {Colors.BOLD}Purpose:{Colors.ENDC}
-  Executes the main BYE BAC agent to perform automated security testing
-  on your API using AI-powered test case generation.
+  Executes the BYEBAC framework to perform policy-driven Broken Access
+  Control testing on a REST API.
 
 {Colors.BOLD}What it does:{Colors.ENDC}
   1. Reads OpenAPI specification to understand your API endpoints
   2. Loads RBAC policies from policy.yaml
-  3. Uses LLM (GPT-4) to generate intelligent test cases
-  4. Tests for BOLA, IDOR, privilege escalation vulnerabilities
-  5. Generates comprehensive JSON and HTML reports
+  3. Builds the operation-account test matrix deterministically
+  4. Uses Gemini only for bounded identifier selection and report summary
+  5. Tests BOLA/IDOR, BFLA, BOPLA, and authentication controls
+  6. Generates JSON and Markdown reports with request/response evidence
 
 {Colors.BOLD}Requirements:{Colors.ENDC}
   • Valid OpenAPI spec in ai_agent/data/openapi.json
   • RBAC policies in ai_agent/config/policy.yaml
   • API credentials in ai_agent/config/auth.yaml
-  • OpenAI API key configured (for LLM access)
+  • Gemini API key configured when LLM-assisted selection is enabled
 
 {Colors.BOLD}When to use:{Colors.ENDC}
   • Running scheduled security scans
@@ -175,7 +176,7 @@ def show_information():
 {Colors.BOLD}Output:{Colors.ENDC}
   • Real-time console output showing test progress
   • JSON report: ai_agent/runs/report-YYYYMMDD-HHMMSS.json
-  • HTML report: ai_agent/runs/report-YYYYMMDD-HHMMSS.html
+  • Markdown report: ai_agent/runs/report-YYYYMMDD-HHMMSS.md
   • Test artifacts in ai_agent/runs/artifacts/
 
 {Colors.BOLD}Duration:{Colors.ENDC}
@@ -219,7 +220,7 @@ def show_information():
             'title': '📄 Open Test Report',
             'description': f"""
 {Colors.BOLD}Purpose:{Colors.ENDC}
-  Displays the location of test reports (JSON and HTML) for detailed
+  Displays the location of test reports (JSON and Markdown) for detailed
   analysis of security findings.
 
 {Colors.BOLD}Usage modes:{Colors.ENDC}
@@ -228,7 +229,7 @@ def show_information():
 
 {Colors.BOLD}What it shows:{Colors.ENDC}
   • Path to JSON report (machine-readable, detailed)
-  • Path to HTML report (human-readable, interactive dashboard)
+  • Path to Markdown report (human-readable summary)
   • Report metadata (timestamp, file size)
 
 {Colors.BOLD}When to use:{Colors.ENDC}
@@ -245,7 +246,7 @@ def show_information():
   • Request/response evidence for each finding
 
 {Colors.BOLD}Tip:{Colors.ENDC}
-  Open HTML report in browser for best visualization and filtering.
+  Use the JSON report to recompute metrics and the Markdown report for review.
             """
         },
         '5': {
@@ -395,17 +396,17 @@ def show_specification():
 
 {Colors.BOLD}{Colors.OKCYAN}LLM Configuration:{Colors.ENDC}
   • Model Provider: Google Generative AI
-  • Primary Model: Gemini 2.5 Flash (gemini-2.5-flash)
-  • Alternative Models: Gemini 2.5 Pro, Gemini 1.5 Pro
+  • Evaluated Model: Gemini 3 Flash Preview (gemini-3-flash-preview)
   • Configuration: Via GEMINI_API_KEY environment variable
-  • Privacy Features: Content redaction (max 1000 chars per snippet)
+  • Bounded Uses: Identifier selection and report summarization
+  • Privacy Features: Redacted, minimized prompt payloads
 
 {Colors.BOLD}{Colors.OKCYAN}Agent Architecture:{Colors.ENDC}
-  • Core Engine: Multi-Agent Orchestrator
-  • Planning Agent: Test case generation & strategy
-  • Tester Agent: Execution & validation
-  • Triager Agent: Result analysis & classification
-  • Memory System: Conversation & test history tracking
+  • Core Engine: AgentOrchestrator
+  • Workflow: Plan → Discover → Execute → Observe → Report
+  • Deterministic Components: Planning, policy resolution, classification
+  • LLM Component: Validated selection from observed candidate IDs
+  • Memory System: Test cases, results, identifiers, and evidence
 
 {Colors.BOLD}{Colors.OKCYAN}Vulnerability Detection:{Colors.ENDC}
   ✓ BOLA (Broken Object Level Authorization)
@@ -419,9 +420,9 @@ def show_specification():
 {Colors.BOLD}{Colors.OKCYAN}Testing Capabilities:{Colors.ENDC}
   • Policy-Based Testing: Uses RBAC policy definitions
   • Baseline Testing: Normal authorized access validation
-  • Mutation Testing: Attack scenario generation
+  • Mutation Testing: Fixed authentication, header, query, and field probes
   • Automated Authentication: Token management per role
-  • Smart Payload Generation: Context-aware test data
+  • Read-Back Verification: Confirms whether restricted writes were applied
 
 {Colors.BOLD}{Colors.OKCYAN}Configuration Files:{Colors.ENDC}
   📄 ai_agent/config/agent.yaml      - Agent behavior settings
@@ -431,15 +432,13 @@ def show_specification():
 
 {Colors.BOLD}{Colors.OKCYAN}Output Formats:{Colors.ENDC}
   • JSON Report: Detailed test results with evidence
-  • HTML Report: Interactive web-based dashboard
-  • CSV Export: Vulnerability matrix
+  • Markdown Report: Human-readable summary
   • Console Logs: Real-time execution monitoring
 
 {Colors.BOLD}{Colors.OKCYAN}Performance:{Colors.ENDC}
-  • Average Speed: 64x faster than manual testing
-  • Coverage: Up to 100% endpoint coverage
-  • Accuracy: ~83% with low false positive rate
-  • Parallel Execution: Concurrent test execution
+  • Sequential execution with configurable delay and timeout
+  • Reports planned, sent, and conclusively evaluated coverage separately
+  • Does not claim a universal speedup or accuracy across applications
 
 {Colors.BOLD}{Colors.OKCYAN}Best Practices:{Colors.ENDC}
   ✓ Keep OpenAPI spec up-to-date with API changes
@@ -739,10 +738,9 @@ def open_report(date_str=None):
     # Display report location
     print(f"JSON Report: {Colors.OKCYAN}{report_file}{Colors.ENDC}")
     
-    # Check for HTML report
-    html_file = report_file.with_suffix('.html')
-    if html_file.exists():
-        print(f"HTML Report: {Colors.OKCYAN}{html_file}{Colors.ENDC}")
+    markdown_file = report_file.with_suffix('.md')
+    if markdown_file.exists():
+        print(f"Markdown Report: {Colors.OKCYAN}{markdown_file}{Colors.ENDC}")
     
     print()
 
